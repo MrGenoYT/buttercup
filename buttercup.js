@@ -298,6 +298,13 @@ const client = new Client({
 });
 client.once("ready", async () => {
   console.log("bot is online!");
+    try {
+    console.log("Started refreshing application (/) commands.");
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    console.log("Successfully reloaded application (/) commands.");
+  } catch (error) {
+    advancedErrorHandler(error, "Slash Command Registration");
+    }
   client.guilds.cache.forEach(async (guild) => {
     try {
       const roleName = "nico";
@@ -690,16 +697,6 @@ const commands = [
     ]
   }
 ];
-const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
-(async () => {
-  try {
-    console.log("Started refreshing application (/) commands.");
-    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-    console.log("Successfully reloaded application (/) commands.");
-  } catch (error) {
-    advancedErrorHandler(error, "Slash Command Registration");
-  }
-})();
 
 //---------------------------------------------------------------------
 // INTERACTION HANDLERS
