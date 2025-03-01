@@ -26,7 +26,139 @@ const MONGO_DB_PASSWORD = process.env.MONGO_DB_PASSWORD;
 const MONGO_URI = `mongodb+srv://ankittsu2:${MONGO_DB_PASSWORD}@cluster0.6grcc.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 const MONGO_DB_NAME = "discord_bot";
 
-// Global toggles and state variables
+// ─── ADDED FOR SLASH COMMAND REGISTRATION ────────────────────────────────
+// Instantiate REST with the token and version so HTTPS requests can be sent.
+const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+
+// ─── ORIGINAL COMMANDS ARRAY (unchanged) ─────────────────────────────────────
+const commands = [
+  { name: "start", description: "Start the bot chatting (server-specific)" },
+  { name: "stop", description: "Stop the bot from chatting (server-specific)" },
+  {
+    name: "setmood",
+    description: "Set your mood (user-based)",
+    options: [
+      { name: "mood", type: 3, description: "Your mood", required: true, choices: Object.keys(moodPresetReplies).map(mood => ({ name: mood, value: mood })) }
+    ]
+  },
+  {
+    name: "setpref",
+    description: "Add a preference (user-based)",
+    options: [
+      { name: "preference", type: 3, description: "Your preference", required: true }
+    ]
+  },
+  { name: "prefremove", description: "View and remove your preferences" },
+  {
+    name: "contreply",
+    description: "Enable or disable continuous reply (user-based)",
+    options: [
+      { name: "mode", type: 3, description: "Choose enable or disable", required: true, choices: [
+        { name: "enable", value: "enable" },
+        { name: "disable", value: "disable" }
+      ] }
+    ]
+  },
+  {
+    name: "debug",
+    description: "Debug commands (only for authorized user)",
+    options: [
+      {
+        type: 3,
+        name: "action",
+        description: "Choose a debug action",
+        required: true,
+        choices: [
+          { name: "ping", value: "ping" },
+          { name: "restart", value: "restart" },
+          { name: "resetmemory", value: "resetmemory" },
+          { name: "clearmemory", value: "clearmemory" },
+          { name: "getstats", value: "getstats" },
+          { name: "listusers", value: "listusers" },
+          { name: "globalchat_on", value: "globalchat_on" },
+          { name: "globalchat_off", value: "globalchat_off" },
+          { name: "globalprefadd", value: "globalprefadd" },
+          { name: "globalprefremove", value: "globalprefremove" },
+          { name: "log", value: "log" },
+          { name: "globalannounce", value: "globalannounce" },
+          { name: "status", value: "status" },
+          { name: "globalmood", value: "globalmood" },
+          { name: "userdb", value: "userdb" }
+        ]
+      },
+      { name: "value", type: 3, description: "Optional value for the action", required: false },
+      { name: "folder", type: 3, description: "Folder name (for database action)", required: false },
+      { name: "server", type: 3, description: "Server ID (for database action)", required: false },
+      { name: "channel", type: 3, description: "Channel ID (for database action)", required: false }
+    ]
+  },
+  {
+    name: "set",
+    description: "Server configuration commands (requires Manage Server/Administrator)",
+    options: [
+      { type: 1, name: "channel", description: "Set an allowed channel for the bot to talk in" },
+      { type: 1, name: "remove", description: "Remove a channel from the bot's allowed channels" }
+    ]
+  },
+  {
+    name: "remember",
+    description: "Store your personal info (name, birthday, gender, dislikes, likes, about)",
+    options: [
+      { name: "name", type: 3, description: "Your name", required: false },
+      { name: "birthday", type: 3, description: "Your birthday", required: false },
+      { name: "gender", type: 3, description: "Your gender", required: false },
+      { name: "dislikes", type: 3, description: "Your dislikes", required: false },
+      { name: "likes", type: 3, description: "Your likes", required: false },
+      { name: "about", type: 3, description: "About you", required: false }
+    ]
+  },
+  { name: "unremember", description: "Remove your stored personal info (interactive menu)" },
+  {
+    name: "meme",
+    description: "Fetch a meme from Reddit (with 3 fallbacks)",
+    options: [
+      { name: "keyword", type: 3, description: "Optional search keyword", required: true }
+    ]
+  },
+  {
+    name: "gif",
+    description: "Fetch a gif from Tenor",
+    options: [
+      { name: "keyword", type: 3, description: "Optional search keyword", required: false }
+    ]
+  }
+];
+
+// ─── ADDED: CONVERT COMMANDS TO SLASHCOMMANDBUILDER OBJECTS ──────────────
+// This maps each command into a new SlashCommandBuilder instance,
+// adds options where available (handling string options and subcommands),
+// and converts them to JSON for registration.
+const slashCommands = commands.map(cmd => {
+  const builder = new SlashCommandBuilder().setName(cmd.name).setDescription(cmd.description);
+  if (cmd.options) {
+    for (const opt of cmd.options) {
+      if (opt.type === 3) { // String option
+        builder.addStringOption(option => {
+          option.setName(opt.name)
+                .setDescription(opt.description)
+                .setRequired(opt.required || false);
+          if (opt.choices) {
+            option.setChoices(...opt.choices);
+          }
+          return option;
+        });
+      } else if (opt.type === 1) { // Subcommand
+        builder.addSubcommand(sub => sub.setName(opt.name).setDescription(opt.description));
+      }
+      // Add additional option types if needed
+    }
+  }
+  return builder.toJSON();
+});
+
+//---------------------------------------------------------------------
+// GLOBAL TOGGLES AND STATE VARIABLES
+//---------------------------------------------------------------------
 let globalChatEnabled = true;
 let globalCustomMood = { enabled: false, mood: null };
 const conversationTracker = new Map(); // key: channelId, value: { count, participants }
@@ -298,13 +430,14 @@ const client = new Client({
 });
 client.once("ready", async () => {
   console.log("bot is online!");
-    try {
+  try {
     console.log("Started refreshing application (/) commands.");
-    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    // ─── UPDATED: Using slashCommands (built with SlashCommandBuilder) for registration ───
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: slashCommands });
     console.log("Successfully reloaded application (/) commands.");
   } catch (error) {
     advancedErrorHandler(error, "Slash Command Registration");
-    }
+  }
   client.guilds.cache.forEach(async (guild) => {
     try {
       const roleName = "nico";
@@ -600,103 +733,7 @@ async function listPreferences(userId) {
 //---------------------------------------------------------------------
 // SLASH COMMANDS REGISTRATION
 //---------------------------------------------------------------------
-const commands = [
-  { name: "start", description: "Start the bot chatting (server-specific)" },
-  { name: "stop", description: "Stop the bot from chatting (server-specific)" },
-  {
-    name: "setmood",
-    description: "Set your mood (user-based)",
-    options: [
-      { name: "mood", type: 3, description: "Your mood", required: true, choices: Object.keys(moodPresetReplies).map(mood => ({ name: mood, value: mood })) }
-    ]
-  },
-  {
-    name: "setpref",
-    description: "Add a preference (user-based)",
-    options: [
-      { name: "preference", type: 3, description: "Your preference", required: true }
-    ]
-  },
-  { name: "prefremove", description: "View and remove your preferences" },
-  {
-    name: "contreply",
-    description: "Enable or disable continuous reply (user-based)",
-    options: [
-      { name: "mode", type: 3, description: "Choose enable or disable", required: true, choices: [
-        { name: "enable", value: "enable" },
-        { name: "disable", value: "disable" }
-      ] }
-    ]
-  },
-  {
-    name: "debug",
-    description: "Debug commands (only for authorized user)",
-    options: [
-      {
-        type: 3,
-        name: "action",
-        description: "Choose a debug action",
-        required: true,
-        choices: [
-          { name: "ping", value: "ping" },
-          { name: "restart", value: "restart" },
-          { name: "resetmemory", value: "resetmemory" },
-          { name: "clearmemory", value: "clearmemory" },
-          { name: "getstats", value: "getstats" },
-          { name: "listusers", value: "listusers" },
-          { name: "globalchat_on", value: "globalchat_on" },
-          { name: "globalchat_off", value: "globalchat_off" },
-          { name: "globalprefadd", value: "globalprefadd" },
-          { name: "globalprefremove", value: "globalprefremove" },
-          { name: "log", value: "log" },
-          { name: "globalannounce", value: "globalannounce" },
-          { name: "status", value: "status" },
-          { name: "globalmood", value: "globalmood" },
-          { name: "userdb", value: "userdb" }
-        ]
-      },
-      { name: "value", type: 3, description: "Optional value for the action", required: false },
-      { name: "folder", type: 3, description: "Folder name (for database action)", required: false },
-      { name: "server", type: 3, description: "Server ID (for database action)", required: false },
-      { name: "channel", type: 3, description: "Channel ID (for database action)", required: false }
-    ]
-  },
-  {
-    name: "set",
-    description: "Server configuration commands (requires Manage Server/Administrator)",
-    options: [
-      { type: 1, name: "channel", description: "Set an allowed channel for the bot to talk in" },
-      { type: 1, name: "remove", description: "Remove a channel from the bot's allowed channels" }
-    ]
-  },
-  {
-    name: "remember",
-    description: "Store your personal info (name, birthday, gender, dislikes, likes, about)",
-    options: [
-      { name: "name", type: 3, description: "Your name", required: false },
-      { name: "birthday", type: 3, description: "Your birthday", required: false },
-      { name: "gender", type: 3, description: "Your gender", required: false },
-      { name: "dislikes", type: 3, description: "Your dislikes", required: false },
-      { name: "likes", type: 3, description: "Your likes", required: false },
-      { name: "about", type: 3, description: "About you", required: false }
-    ]
-  },
-  { name: "unremember", description: "Remove your stored personal info (interactive menu)" },
-  {
-    name: "meme",
-    description: "Fetch a meme from Reddit (with 3 fallbacks)",
-    options: [
-      { name: "keyword", type: 3, description: "Optional search keyword", required: true }
-    ]
-  },
-  {
-    name: "gif",
-    description: "Fetch a gif from Tenor",
-    options: [
-      { name: "keyword", type: 3, description: "Optional search keyword", required: false }
-    ]
-  }
-];
+// (Registration is handled in client.once("ready") using the slashCommands array.)
 
 //---------------------------------------------------------------------
 // INTERACTION HANDLERS
