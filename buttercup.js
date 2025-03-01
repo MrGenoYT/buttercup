@@ -308,7 +308,6 @@ client.once("ready", async () => {
     }
   });
 });
-});
 client.on("error", (error) => advancedErrorHandler(error, "Client Error"));
 client.on("warn", (info) => console.warn("Client Warning:", info));
 
