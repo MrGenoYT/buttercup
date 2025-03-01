@@ -3,6 +3,7 @@
   "version": "1.0.2",
   "description": "buttercup",
   "main": "buttercup.js",
+  "type": "module",
   "scripts": {
     "start": "node buttercup.js"
   },
@@ -17,5 +18,6 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "license": "MIT"
+  "author": "Geno aka ankit",
+  "license": "take permission first"
 }
