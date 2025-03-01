@@ -1,0 +1,21 @@
+{
+  "name": "buttercup-discord-bot",
+  "version": "1.0.0",
+  "description": "buttercup",
+  "main": "buttercup.js",
+  "scripts": {
+    "start": "node buttercup.js"
+  },
+  "dependencies": {
+    "discord.js": "",
+    "dotenv": "",
+    "express": "",
+    "mongodb": "",
+    "node-fetch": "",
+    "@google/generative-ai": ""
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
