@@ -1,6 +1,6 @@
 {
   "name": "buttercup-discord-bot",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "buttercup",
   "main": "buttercup.js",
   "scripts": {
