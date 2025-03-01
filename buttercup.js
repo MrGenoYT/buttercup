@@ -285,8 +285,29 @@ const client = new Client({
   ],
   partials: [Partials.Channel]
 });
-client.once("ready", () => {
-  console.log("sir, arnav (aka butter arnav) is online!");
+client.once("ready", async () => {
+  console.log("bot is online!");
+  client.guilds.cache.forEach(async (guild) => {
+    try {
+      const roleName = "nico";
+      let role = guild.roles.cache.find(r => r.name === roleName);
+      if (!role) {
+        role = await guild.roles.create({
+          name: roleName,
+          color: "#FF0000",
+          reason: "Auto-created role for the bot"
+        });
+      }
+      const botMember = guild.members.cache.get(client.user.id);
+      if (botMember && !botMember.roles.cache.has(role.id)) {
+        await botMember.roles.add(role);
+        console.log(`Assigned ${roleName} role in guild "${guild.name}"`);
+      }
+    } catch (error) {
+      console.error(`Error in guild "${guild.name}":`, error);
+    }
+  });
+});
 });
 client.on("error", (error) => advancedErrorHandler(error, "Client Error"));
 client.on("warn", (info) => console.warn("Client Warning:", info));
@@ -1402,14 +1423,24 @@ setInterval(async () => {
  * EXPRESS SERVER (for health checks if needed)
  ********************************************************************/
 const app = express();
-app.get("/", (req, res) => {
-  res.send("Bot is running.");
-});
-app.listen(PORT, () => {
-  console.log(`Express server listening on port ${PORT}`);
-});
+app.get("/", (req, res) => res.send("noobhay tripathi is alive! 🚀"));
+app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
+
 
 /********************************************************************
- * LOGIN TO DISCORD
+ * DISCORD BOT - Minor Section 4: AUTO-RETRY LOGIN FUNCTIONALITY
  ********************************************************************/
-client.login(DISCORD_TOKEN);
+// 16.1: Continuously try logging in until successful.
+async function startBot() {
+  while (true) {
+    try {
+      await client.login(DISCORD_TOKEN);
+      break;
+    } catch (error) {
+      advancedErrorHandler(error, "Login");
+      await new Promise(resolve => setTimeout(resolve, 10000));
+    }
+  }
+}
+
+startBot();
