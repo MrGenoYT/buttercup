@@ -8,12 +8,12 @@
     "start": "node buttercup.js"
   },
   "dependencies": {
-    "discord.js": "",
-    "dotenv": "",
-    "express": "",
-    "mongodb": "",
-    "node-fetch": "",
-    "@google/generative-ai": ""
+    "discord.js": "^14.11.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "mongodb": "^5.6.0",
+    "node-fetch": "^3.3.1",
+    "@google/generative-ai": "^0.4.0"
   },
   "engines": {
     "node": ">=18.0.0"
