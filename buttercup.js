@@ -1522,16 +1522,13 @@ client.on("messageCreate", async (message) => {
 });
 
 /********************************************************************
+ /********************************************************************
  * DISCORD BOT - Major Section 13: EXPRESS SERVER FOR UPTIME MONITORING
  ********************************************************************/
+// 15.1: Set up a simple express server to keep the bot alive.
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.get("/", (req, res) => res.send("Bot is alive! 🚀"));
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ Web server running on port ${PORT}`);
-});
+app.get("/", (req, res) => res.send("bot is alive! 🚀"));
+app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
 
 /********************************************************************
  * DISCORD BOT - Minor Section 4: AUTO-RETRY LOGIN FUNCTIONALITY
