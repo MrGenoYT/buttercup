@@ -73,6 +73,7 @@ function getDB(guildId = null) {
 async function dbInsert(db, collectionName, doc) {
   try {
     await db.collection(collectionName).insertOne(doc);
+    console.log(`dbInsert: Document inserted into ${collectionName}.`);
   } catch (error) {
     advancedErrorHandler(error, "dbInsert");
   }
@@ -81,6 +82,7 @@ async function dbInsert(db, collectionName, doc) {
 async function dbUpdate(db, collectionName, filter, update, options = {}) {
   try {
     await db.collection(collectionName).updateOne(filter, update, { upsert: true, ...options });
+    console.log(`dbUpdate: Document updated in ${collectionName} with filter ${JSON.stringify(filter)}.`);
   } catch (error) {
     advancedErrorHandler(error, "dbUpdate");
   }
@@ -88,7 +90,9 @@ async function dbUpdate(db, collectionName, filter, update, options = {}) {
 
 async function dbFind(db, collectionName, filter = {}, options = {}) {
   try {
-    return await db.collection(collectionName).find(filter, options).toArray();
+    const result = await db.collection(collectionName).find(filter, options).toArray();
+    console.log(`dbFind: Found ${result.length} documents in ${collectionName} with filter ${JSON.stringify(filter)}.`);
+    return result;
   } catch (error) {
     advancedErrorHandler(error, "dbFind");
     return [];
@@ -280,6 +284,7 @@ async function performOCR(imageUrl) {
     const ocrPrompt = `Please extract any text from the following image URL: ${imageUrl}`;
     const result = await model.generateContent(ocrPrompt);
     let ocrText = (result.response && result.response.text()) || "";
+    console.log("performOCR: OCR completed for image:", imageUrl);
     return ocrText.trim();
   } catch (error) {
     advancedErrorHandler(error, "performOCR");
@@ -301,7 +306,7 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-  client.once("ready", async () => {
+client.once("ready", async () => {
   console.log("sir, bot is online!");
   client.guilds.cache.forEach(async (guild) => {
     try {
@@ -330,7 +335,7 @@ client.on("warn", (info) => console.warn("Client Warning:", info));
 /********************************************************************
  * DISCORD BOT - Minor Section 2: GLOBAL STATE & HELPER FUNCTIONS
  ********************************************************************/
-const conversationTracker = new Map(); // key: channelId, value: { count, participants }
+const conversationTracker = new Map(); // key: channelId, value: { count, participants, multiCount }
 const userContinuousReply = new Map();
 let lastBotMessageContent = "";
 let lastReply = "";
@@ -362,6 +367,7 @@ async function getRandomMeme(searchKeyword = "funny") {
     if (memePost.url.includes("googlelogo_desk_heirloom_color")) {
       throw new Error("Meme URL appears to be invalid.");
     }
+    console.log("getRandomMeme: Successfully fetched meme from Reddit.");
     return { url: memePost.url, name: memePost.title || "meme" };
   } catch (error) {
     advancedErrorHandler(error, "getRandomMeme - Reddit");
@@ -385,6 +391,7 @@ async function getRandomMemeFromIFunny(searchKeyword = "funny") {
     const match = html.match(/<img[^>]+src="([^"]+)"/);
     const imageUrl = match ? match[1] : null;
     if (!imageUrl) throw new Error("No memes found on iFunny.");
+    console.log("getRandomMemeFromIFunny: Meme fetched from iFunny.");
     return { url: imageUrl, name: "iFunny Meme" };
   } catch (error) {
     advancedErrorHandler(error, "getRandomMemeFromIFunny");
@@ -405,6 +412,7 @@ async function getRandomMemeFromGoogle(searchKeyword = "funny") {
     if (!imageUrl) throw new Error("No memes found on Google.");
     // Ensure that we return a direct link (fixing the attachment issue)
     if (imageUrl.startsWith("//")) imageUrl = "https:" + imageUrl;
+    console.log("getRandomMemeFromGoogle: Meme fetched from Google.");
     return { url: imageUrl, name: "Google Meme" };
   } catch (error) {
     advancedErrorHandler(error, "getRandomMemeFromGoogle");
@@ -425,6 +433,7 @@ async function getRandomGif(searchKeyword = "funny") {
       return { url: "couldn't find a gif, sorry.", name: "unknown gif" };
     }
     const gifUrl = data.results[0].media_formats.gif.url;
+    console.log("getRandomGif: Successfully fetched a gif.");
     return { url: gifUrl, name: data.results[0].title || "gif" };
   } catch (error) {
     advancedErrorHandler(error, "getRandomGif");
@@ -443,6 +452,7 @@ async function performWebSearch(query) {
     const regex = /<div class="BNeawe[^>]*>(.*?)<\/div>/;
     const match = regex.exec(html);
     let snippet = match && match[1] ? match[1] : "No snippet available.";
+    console.log("performWebSearch: Search completed for query:", query);
     return snippet;
   } catch (error) {
     console.error("Web search error:", error);
@@ -454,6 +464,7 @@ async function storeMedia(type, url, name) {
   try {
     const db = getDB(); // Using DM db for global media library
     await dbInsert(db, "media_library", { type, url, name, timestamp: new Date() });
+    console.log(`storeMedia: Stored ${type} with name "${name}".`);
   } catch (error) {
     advancedErrorHandler(error, "storeMedia");
   }
@@ -473,44 +484,67 @@ function analyzeTone(messageContent) {
 function updateConversationTracker(message) {
   const channelId = message.channel.id;
   if (!conversationTracker.has(channelId)) {
-    conversationTracker.set(channelId, { count: 0, participants: new Map() });
+    conversationTracker.set(channelId, { count: 0, participants: new Map(), multiCount: 0 });
   }
   const tracker = conversationTracker.get(channelId);
   tracker.count++;
   tracker.participants.set(message.author.id, tracker.count);
+  // If only one participant in this message, increment multiCount, else reset it.
+  if (tracker.participants.size === 1) {
+    tracker.multiCount = (tracker.multiCount || 0) + 1;
+  } else {
+    tracker.multiCount = 0;
+  }
+  // If no multi-user conversation for 3 messages, switch back to single.
+  if (tracker.multiCount >= 3) {
+    console.log(`updateConversationTracker: No multi-user conversation for 3 messages in channel ${channelId}, switching to single.`);
+    tracker.participants.clear();
+    tracker.participants.set(message.author.id, tracker.count);
+    tracker.multiCount = 0;
+  }
+  // Remove participants if the difference is more than 3 messages.
   for (const [userId, lastIndex] of tracker.participants.entries()) {
-    if (tracker.count - lastIndex > 5) {
+    if (tracker.count - lastIndex > 3) {
       tracker.participants.delete(userId);
     }
   }
+  console.log(`updateConversationTracker: Channel ${channelId} tracker updated. Participants: ${tracker.participants.size}, count: ${tracker.count}`);
 }
 
 function shouldReply(message) {
-  if (userContinuousReply.get(message.author.id)) return true;
+  if (userContinuousReply.get(message.author.id)) {
+    console.log("shouldReply: continuous reply enabled for user", message.author.id);
+    return true;
+  }
   const lower = message.content.toLowerCase();
   if (lower.includes("butter") || lower.includes("arnav")) {  // modified names
+    console.log("shouldReply: message explicitly mentions bot names, replying with high probability.");
     return Math.random() < 0.95;
   }
   updateConversationTracker(message);
   const tracker = conversationTracker.get(message.channel.id);
   const isMultiUser = tracker.participants.size > 1;
   const skipThreshold = isMultiUser ? 2 : 1;
-  if (tracker.count < skipThreshold) return false;
+  if (tracker.count < skipThreshold) {
+    console.log("shouldReply: not enough messages yet, skipping reply.");
+    return false;
+  }
   tracker.count = 0;
-  const chanceNotReply = isMultiUser ? 0.20 : 0.25;
-  return Math.random() >= chanceNotReply;
+  const chanceNotReply = isMultiUser ? 0.20 : 0.30;
+  const result = Math.random() >= chanceNotReply;
+  console.log(`shouldReply: isMultiUser=${isMultiUser}, chanceNotReply=${chanceNotReply}, result=${result}`);
+  return result;
 }
 
 async function fetchOlderMemory(userMessage) {
   try {
     const words = userMessage.split(/\s+/).filter(word => word.length > 3);
     if (words.length === 0) return "";
-    // For MongoDB, search in chat_messages collection across the appropriate DB
-    // Here we use the DM database as a fallback for older memory (for simplicity)
     const db = getDB();
     const orFilters = words.map(word => ({ content: { $regex: word, $options: "i" } }));
     const extraRows = await dbFind(db, "chat_messages", { timestamp: { $lt: new Date(Date.now() - 3 * 24 * 3600 * 1000) }, $or: orFilters }, { sort: { timestamp: -1 }, limit: 5 });
     if (extraRows.length > 0) {
+      console.log("fetchOlderMemory: Fetched older memory for context.");
       return "\nOlder conversation context:\n" + extraRows.reverse().map(r => r.content).join("\n");
     }
     return "";
@@ -525,7 +559,6 @@ async function fetchOlderMemory(userMessage) {
  ********************************************************************/
 async function chatWithGemini(userId, userMessage) {
   try {
-    // Retrieve recent chat history from MongoDB DM collection
     const db = getDB();
     const rows = await dbFind(db, "chat_messages", {}, { sort: { timestamp: 1 }, limit: 100 });
     const recentChat = rows.map(r => r.content).join("\n");
@@ -571,9 +604,9 @@ Reply (be modern, witty, and brutally offensive if appropriate; keep reply under
     let reply = (result.response && result.response.text()) || "i'm having a moment, try again.";
     const wordsArr = reply.trim().split(/\s+/);
     if (wordsArr.length > 40) reply = wordsArr.slice(0, 40).join(" ");
-    // Update user analytics in MongoDB
     await dbUpdate(db, "user_data", { user_id: userId }, { $setOnInsert: { username, behavior: { interactions: 0 }, preferences: [] } });
     await db.collection("user_data").updateOne({ user_id: userId }, { $inc: { "behavior.interactions": 1 }, $set: { username } });
+    console.log("chatWithGemini: Reply generated successfully for user", userId);
     return reply;
   } catch (error) {
     advancedErrorHandler(error, "chatWithGemini");
@@ -1077,7 +1110,6 @@ Global custom mood: ${globalCustomMood.enabled ? globalCustomMood.mood : "disabl
             break;
           }
           case "userdb": {
-            // New debug action: Show the DM user's database contents.
             const db = getDB(); // DM database
             const userData = await dbFind(db, "user_data", { user_id: interaction.user.id });
             const moodData = await dbFind(db, "mood_data", { user_id: interaction.user.id });
@@ -1447,7 +1479,6 @@ Remembered Info: ${JSON.stringify(remembered)}`;
           const channelIds = Array.from(textChannels.keys());
           let totalInteracted = "N/A";
           if (channelIds.length > 0) {
-            // For MongoDB, count distinct users in chat_messages
             const db = getDB(guild.id);
             const usersCount = await db.collection("chat_messages").distinct("user");
             totalInteracted = usersCount.length;
@@ -1498,7 +1529,6 @@ client.on("messageCreate", async (message) => {
       }
     }
     if (!globalChatEnabled) return;
-    // Store chat messages in the appropriate MongoDB collection.
     const db = message.guild ? getDB(message.guild.id) : getDB();
     await dbInsert(db, "chat_messages", {
       discord_id: message.id,
@@ -1513,8 +1543,26 @@ client.on("messageCreate", async (message) => {
       if (settings.chat_enabled !== 1) return;
     }
     if (shouldReply(message)) {
-      const replyText = await chatWithGemini(message.author.id, message.content);
-      message.reply(replyText);
+      const r = Math.random();
+      if (r < 0.10) {
+        console.log("Message Handler: Additional skip chance triggered, not replying.");
+        return;
+      }
+      let replyCount = 1;
+      if (r < 0.10 + 0.05) {
+        replyCount = 2;
+      } else if (r < 0.10 + 0.05 + 0.01) {
+        replyCount = 3;
+      }
+      for (let i = 0; i < replyCount; i++) {
+        const replyText = await chatWithGemini(message.author.id, message.content);
+        if (message.mentions.users.has(client.user.id)) {
+          message.reply(replyText);
+        } else {
+          message.channel.send(replyText);
+        }
+        console.log(`Message Handler: Sent reply (${i+1}/${replyCount}) in response to message ${message.id}`);
+      }
     }
   } catch (error) {
     advancedErrorHandler(error, "Message Handler");
@@ -1522,10 +1570,8 @@ client.on("messageCreate", async (message) => {
 });
 
 /********************************************************************
- /********************************************************************
- * DISCORD BOT - Major Section 16: EXPRESS SERVER FOR UPTIME MONITORING
+ * DISCORD BOT - Major Section 13: EXPRESS SERVER FOR UPTIME MONITORING
  ********************************************************************/
-// 16.1: Set up a simple express server to keep the bot alive.
 const app = express();
 app.get("/", (req, res) => res.send("bot is alive! 🚀"));
 app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
@@ -1534,14 +1580,23 @@ app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
  * DISCORD BOT - Minor Section 4: AUTO-RETRY LOGIN FUNCTIONALITY
  ********************************************************************/
 async function startBot() {
-  while (true) {
+  let retries = 0;
+  const maxRetries = 5;
+  while (retries < maxRetries) {
     try {
       await client.login(DISCORD_TOKEN);
+      console.log("startBot: Bot logged in successfully.");
       break;
     } catch (error) {
       advancedErrorHandler(error, "Login");
+      retries++;
+      console.log(`startBot: Retry attempt ${retries} of ${maxRetries}.`);
       await new Promise(resolve => setTimeout(resolve, 10000)); // Retry every 10 seconds
     }
+  }
+  if (retries === maxRetries) {
+    console.error("startBot: Failed to login after maximum retries. Exiting.");
+    process.exit(1);
   }
 }
 
