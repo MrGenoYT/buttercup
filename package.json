@@ -4,7 +4,9 @@
   "main": "buttercup.js",
   "type": "module",
   "scripts": {
-    "start": "node buttercup.js"
+    "preinstall": "npm install -g npm@latest",
+    "start": "node buttercup.js",
+    "dev": "nodemon buttercup.js"
   },
   "dependencies": {
     "discord.js": "^14.11.0",
