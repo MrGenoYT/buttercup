@@ -19,7 +19,7 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const TENOR_API_KEY = process.env.TENOR_API_KEY;
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 45678;
 const MONGO_URI = process.env.MONGO_URI; // MongoDB connection URI
 
 // Global chat toggle for all servers (default ON)
