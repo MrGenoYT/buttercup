@@ -4,21 +4,20 @@
   "main": "buttercup.js",
   "type": "module",
   "scripts": {
-    "preinstall": "npm install -g npm@latest",
     "start": "node buttercup.js",
     "dev": "nodemon buttercup.js"
   },
   "dependencies": {
-    "discord.js": "",
-    "dotenv": "",
-    "express": "",
-    "mongodb": "",
-    "node-fetch": "",
-    "@google/generative-ai": ""
+    "discord.js": "*",
+    "dotenv": "*",
+    "express": "*",
+    "mongodb": "*",
+    "node-fetch": "*",
+    "@google/generative-ai": "*"
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "author": "Geno aka ankit",
-  "license": "take permission first"
+  "license": "Proprietary"
 }
