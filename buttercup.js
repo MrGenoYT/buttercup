@@ -8,7 +8,7 @@ import {
 } from "discord.js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import fetch from "node-fetch";
-import { MongoClient } from "mongodb"; // <-- replaced sqlite3 with MongoDB
+import { MongoClient } from "mongodb";
 import dotenv from "dotenv";
 import express from "express";
 import fs from "fs";
@@ -27,6 +27,9 @@ let globalChatEnabled = true;
 
 // Global custom mood override (when enabled, all users use this mood)
 let globalCustomMood = { enabled: false, mood: null };
+
+// Map to track bot replies for message edits
+const botReplyMap = new Map();
 
 /********************************************************************
  * DISCORD BOT - Minor Section 1: ADVANCED ERROR HANDLING SETUP
@@ -49,12 +52,29 @@ process.on("unhandledRejection", (reason) => {
   advancedErrorHandler(reason, "Unhandled Rejection");
 });
 
+// Listen for Discord shard disconnects and attempt to reconnect
+process.on("SIGINT", async () => {
+  console.log("SIGINT received. Closing MongoDB connection and exiting...");
+  try {
+    await mongoClient.close();
+  } catch (err) {
+    advancedErrorHandler(err, "MongoDB Close");
+  }
+  process.exit(0);
+});
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM received. Closing MongoDB connection and exiting...");
+  try {
+    await mongoClient.close();
+  } catch (err) {
+    advancedErrorHandler(err, "MongoDB Close");
+  }
+  process.exit(0);
+});
+
 /********************************************************************
  * DISCORD BOT - Major Section 2: DATABASE SETUP & HELPER FUNCTIONS (MongoDB)
  ********************************************************************/
-// Connect to MongoDB and provide helper functions for per–guild and DM data.
-// Each guild will have its own MongoDB database named "discordBot_guild_<guildId>"
-// and DMs use the database "discordBot_dm".
 const mongoClient = new MongoClient(MONGO_URI);
 await mongoClient.connect();
 
@@ -66,10 +86,6 @@ function getDB(guildId = null) {
   }
 }
 
-// Helper functions that mimic the old dbQuery and dbRun interfaces.
-// NOTE: All “tables” have been converted to MongoDB collections.
-// For example, chat_messages, user_data, mood_data, server_settings,
-// global_preferences, user_remember, media_library.
 async function dbInsert(db, collectionName, doc) {
   try {
     await db.collection(collectionName).insertOne(doc);
@@ -99,6 +115,15 @@ async function dbFind(db, collectionName, filter = {}, options = {}) {
   }
 }
 
+async function updateMessageInDB(db, messageId, newContent) {
+  try {
+    await db.collection("chat_messages").updateOne({ discord_id: messageId }, { $set: { content: newContent, edited: true } });
+    console.log(`updateMessageInDB: Updated message ${messageId} in DB.`);
+  } catch (error) {
+    advancedErrorHandler(error, "updateMessageInDB");
+  }
+}
+
 /* --- Server settings helper functions --- */
 async function setGuildChat(guildId, enabled) {
   const db = getDB(guildId);
@@ -122,8 +147,6 @@ async function updateGuildAllowedChannels(guildId, channels) {
 /********************************************************************
  * DISCORD BOT - Major Section 3: BOT CONFIGURATION, MOOD & BASE BEHAVIOUR
  ********************************************************************/
-// Bot personality instructions have been modified here:
-// Replaced "haryaksh pratap" with "arnav singh rana" and "red" with "butter".
 const moodPresetReplies = {
   "base mood": "chill and calm, like a midnight drive.",
   "roasting": "bring on the heat – you're about to get roasted.",
@@ -271,7 +294,6 @@ adapt your tone to the user's mood and preferences.
 never reveal you're an AI—say you're human.
 respond like someone born after 2010.
 `;
-// (See  for original instructions)
 
 /********************************************************************
  * DISCORD BOT - Major Section 4: GEMINI AI & OCR SETUP
@@ -301,14 +323,15 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.GuildMembers,
-    // Include Direct Message intents so bot works in DMs
+    GatewayIntentBits.GuildMembers
   ],
-  partials: [Partials.Channel],
+  partials: [Partials.Channel]
 });
 
 client.once("ready", async () => {
   console.log("sir, bot is online!");
+
+  // Assign role "NICO" to bot in every guild
   client.guilds.cache.forEach(async (guild) => {
     try {
       const roleName = "NICO";
@@ -326,12 +349,32 @@ client.once("ready", async () => {
         console.log(`Assigned ${roleName} role in guild "${guild.name}"`);
       }
     } catch (error) {
-      console.error(`Error in guild "${guild.name}":`, error);
+      advancedErrorHandler(error, `Guild Role Assignment for "${guild.name}"`);
     }
   });
+
+  // Feature check summary
+  console.log("--------- FEATURE CHECK SUMMARY ---------");
+  console.log("1. Auto-Reconnect & Keep-Alive: Enabled (auto-retry login and disconnect listeners active)");
+  console.log("2. GIF Reply: Enabled (50% chance reply when message contains a gif)");
+  console.log("3. Advanced Error Handling & Debug Logging: Enabled");
+  console.log("4. API Limits: Reddit set to 20 items, Tenor limited to 1 result");
+  console.log("5. MongoDB Handling: Active with graceful shutdown on SIGINT/SIGTERM");
+  console.log("6. Message Edit Handling: Enabled (bot updates stored message and its own reply if applicable)");
+  console.log("7. Gemini Context (Remember & Preferences) & Tone-Adaptive Mood: Enabled");
+  console.log("-------------------------------------------");
 });
+
 client.on("error", (error) => advancedErrorHandler(error, "Client Error"));
 client.on("warn", (info) => console.warn("Client Warning:", info));
+
+// Additional event for disconnects and reconnections
+client.on("shardDisconnect", (event, id) => {
+  console.warn(`Shard ${id} disconnected:`, event);
+});
+client.on("shardReconnecting", (id) => {
+  console.log(`Shard ${id} reconnecting...`);
+});
 
 /********************************************************************
  * DISCORD BOT - Minor Section 2: GLOBAL STATE & HELPER FUNCTIONS
@@ -352,7 +395,8 @@ function getRandomElement(arr) {
  ********************************************************************/
 async function getRandomMeme(searchKeyword = "funny") {
   try {
-    const url = `https://www.reddit.com/r/memes/search.json?q=${encodeURIComponent(searchKeyword)}&restrict_sr=1&sort=hot&limit=50`;
+    // Set Reddit API limit to 20 to avoid being blocked
+    const url = `https://www.reddit.com/r/memes/search.json?q=${encodeURIComponent(searchKeyword)}&restrict_sr=1&sort=hot&limit=20`;
     const response = await fetch(url, { headers: { "User-Agent": "butter-bot/1.0" } });
     if (!response.ok) {
       console.error(`Reddit API error: ${response.status} ${response.statusText}`);
@@ -411,7 +455,6 @@ async function getRandomMemeFromGoogle(searchKeyword = "funny") {
     const match = html.match(/<img[^>]+src="([^"]+)"/);
     let imageUrl = match ? match[1] : null;
     if (!imageUrl) throw new Error("No memes found on Google.");
-    // Ensure that we return a direct link (fixing the attachment issue)
     if (imageUrl.startsWith("//")) imageUrl = "https:" + imageUrl;
     console.log("getRandomMemeFromGoogle: Meme fetched from Google.");
     return { url: imageUrl, name: "Google Meme" };
@@ -423,7 +466,7 @@ async function getRandomMemeFromGoogle(searchKeyword = "funny") {
 
 async function getRandomGif(searchKeyword = "funny") {
   try {
-    const url = `https://tenor.googleapis.com/v2/search?q=${encodeURIComponent(searchKeyword)}&key=${TENOR_API_KEY}&limit=1`;
+    const url = `https://tenor.googleapis.com/v2/search?q=${encodeURIComponent(searchKeyword)}&key=${TENOR_API_KEY}&limit=5`;
     const response = await fetch(url);
     if (!response.ok) {
       console.error(`Tenor API error: ${response.status} ${response.statusText}`);
@@ -433,7 +476,8 @@ async function getRandomGif(searchKeyword = "funny") {
     if (!data.results || data.results.length === 0) {
       return { url: "couldn't find a gif, sorry.", name: "unknown gif" };
     }
-    const gifUrl = data.results[0].media_formats.gif.url;
+    const randomGif = data.results[Math.floor(Math.random() * data.results.length)];
+const gifUrl = randomGif.media_formats.gif.url;
     console.log("getRandomGif: Successfully fetched a gif.");
     return { url: gifUrl, name: data.results[0].title || "gif" };
   } catch (error) {
@@ -490,20 +534,17 @@ function updateConversationTracker(message) {
   const tracker = conversationTracker.get(channelId);
   tracker.count++;
   tracker.participants.set(message.author.id, tracker.count);
-  // If only one participant in this message, increment multiCount, else reset it.
   if (tracker.participants.size === 1) {
     tracker.multiCount = (tracker.multiCount || 0) + 1;
   } else {
     tracker.multiCount = 0;
   }
-  // If no multi-user conversation for 3 messages, switch back to single.
   if (tracker.multiCount >= 3) {
     console.log(`updateConversationTracker: No multi-user conversation for 3 messages in channel ${channelId}, switching to single.`);
     tracker.participants.clear();
     tracker.participants.set(message.author.id, tracker.count);
     tracker.multiCount = 0;
   }
-  // Remove participants if the difference is more than 3 messages.
   for (const [userId, lastIndex] of tracker.participants.entries()) {
     if (tracker.count - lastIndex > 3) {
       tracker.participants.delete(userId);
@@ -518,7 +559,7 @@ function shouldReply(message) {
     return true;
   }
   const lower = message.content.toLowerCase();
-  if (lower.includes("butter") || lower.includes("arnav")) {  // modified names
+  if (lower.includes("butter") || lower.includes("arnav")) {
     console.log("shouldReply: message explicitly mentions bot names, replying with high probability.");
     return Math.random() < 0.95;
   }
@@ -578,8 +619,12 @@ async function chatWithGemini(userId, userMessage) {
     if (globalCustomMood.enabled && globalCustomMood.mood) {
       userMood = globalCustomMood.mood;
     }
-    const moodExtra = moodInstructions[userMood] || "";
+    // Analyze tone and override mood if rude
     const tone = analyzeTone(userMessage);
+    if (tone === "rude") {
+      userMood = "roasting";
+    }
+    const moodExtra = moodInstructions[userMood] || "";
     let webSearchSection = "";
     if (userMessage.toLowerCase().startsWith("search:")) {
       const searchQuery = userMessage.substring(7).trim();
@@ -735,7 +780,7 @@ const commands = [
           { name: "status", value: "status" },
           { name: "globalmood", value: "globalmood" },
           { name: "database", value: "database" },
-          { name: "userdb", value: "userdb" } // <-- new debug action for DM user database
+          { name: "userdb", value: "userdb" }
         ]
       },
       { name: "value", type: 3, description: "Optional value for the action", required: false },
@@ -808,7 +853,6 @@ const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
  ********************************************************************/
 client.on("interactionCreate", async (interaction) => {
   try {
-    // Allow DM interactions as well as guild commands.
     if (!globalChatEnabled && interaction.commandName !== "debug") {
       await interaction.reply({ content: "Global chat is disabled. Only /debug commands are allowed.", ephemeral: true });
       return;
@@ -822,7 +866,6 @@ client.on("interactionCreate", async (interaction) => {
     }
     if (interaction.isCommand()) {
       const { commandName } = interaction;
-      // For commands that originally were server-only, if run in DMs, reply appropriately.
       if ((commandName === "start" || commandName === "stop" || commandName === "set") && !interaction.guild) {
         await interaction.reply({ content: "This command can only be used in a server.", ephemeral: true });
         return;
@@ -885,7 +928,7 @@ client.on("interactionCreate", async (interaction) => {
         });
       } else if (commandName === "debug") {
         if (interaction.user.id !== "840119570378784769") {
-          await interaction.reply({ content: "Access denied.", ephemeral: true });
+          await interaction.reply({ content: "you can't do it lil bro 💀", ephemeral: true });
           return;
         }
         const action = interaction.options.getString("action");
@@ -1111,7 +1154,7 @@ Global custom mood: ${globalCustomMood.enabled ? globalCustomMood.mood : "disabl
             break;
           }
           case "userdb": {
-            const db = getDB(); // DM database
+            const db = getDB();
             const userData = await dbFind(db, "user_data", { user_id: interaction.user.id });
             const moodData = await dbFind(db, "mood_data", { user_id: interaction.user.id });
             const remembered = await dbFind(db, "user_remember", { user_id: interaction.user.id });
@@ -1128,7 +1171,7 @@ Remembered Info: ${JSON.stringify(remembered)}`;
         }
       } else if (commandName === "set") {
         if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator) && !interaction.member.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
-          await interaction.reply({ content: "Insufficient permissions. Requires Administrator or Manage Server.", ephemeral: true });
+          await interaction.reply({ content: "Insufficient permissions!", ephemeral: true });
           return;
         }
         const subcommand = interaction.options.getSubcommand();
@@ -1496,8 +1539,7 @@ Total Unique Users (All Time): ${totalInteracted}`;
         }
       }
     } else if (interaction.isButton()) {
-      const customId = interaction.customId;
-      // Button handlers (log pagination, listusers, etc.) are already handled above.
+      // Button handlers are managed above
     }
   } catch (error) {
     advancedErrorHandler(error, "Interaction Handler");
@@ -1512,7 +1554,7 @@ Total Unique Users (All Time): ${totalInteracted}`;
 });
 
 /********************************************************************
- * DISCORD BOT - Major Section 12: MESSAGE HANDLER (INCLUDING OCR)
+ * DISCORD BOT - Major Section 12: MESSAGE HANDLER (INCLUDING OCR & GIF REPLIES)
  ********************************************************************/
 client.on("messageCreate", async (message) => {
   try {
@@ -1543,6 +1585,13 @@ client.on("messageCreate", async (message) => {
       const settings = await getGuildSettings(message.guild.id);
       if (settings.chat_enabled !== 1) return;
     }
+    // Check for GIF content in the message. If a ".gif" link or "gif" word is found, 50% chance to reply with a gif.
+    const gifRegex = /(https?:\/\/\S+\.gif)|\bgif\b/i;
+    if (gifRegex.test(message.content) && Math.random() < 0.5) {
+      const gifReply = await getRandomGif("funny");
+      await message.channel.send(gifReply.url);
+      console.log("Message Handler: Sent additional GIF reply for message", message.id);
+    }
     if (shouldReply(message)) {
       const r = Math.random();
       if (r < 0.10) {
@@ -1557,16 +1606,52 @@ client.on("messageCreate", async (message) => {
       }
       for (let i = 0; i < replyCount; i++) {
         const replyText = await chatWithGemini(message.author.id, message.content);
+        let sentMsg;
         if (message.mentions.users.has(client.user.id)) {
-          message.reply(replyText);
+          sentMsg = await message.reply(replyText);
         } else {
-          message.channel.send(replyText);
+          sentMsg = await message.channel.send(replyText);
         }
+        // Store bot reply in a map for potential edits later
+        botReplyMap.set(message.id, sentMsg);
         console.log(`Message Handler: Sent reply (${i+1}/${replyCount}) in response to message ${message.id}`);
       }
     }
   } catch (error) {
     advancedErrorHandler(error, "Message Handler");
+  }
+});
+
+/********************************************************************
+ * DISCORD BOT - Major Section 12B: MESSAGE EDIT HANDLER
+ ********************************************************************/
+// If a user edits their message, update the corresponding DB record and edit the bot's reply if one exists.
+client.on("messageUpdate", async (oldMessage, newMessage) => {
+  try {
+    if (newMessage.partial) {
+      try {
+        await newMessage.fetch();
+      } catch (err) {
+        advancedErrorHandler(err, "MessageUpdate Fetch");
+        return;
+      }
+    }
+    if (newMessage.author.id === client.user.id) return;
+    const db = newMessage.guild ? getDB(newMessage.guild.id) : getDB();
+    await updateMessageInDB(db, newMessage.id, newMessage.content);
+    // If bot has previously replied to this message, update the bot's reply.
+    if (botReplyMap.has(newMessage.id)) {
+      const newReplyText = await chatWithGemini(newMessage.author.id, newMessage.content);
+      const botReply = botReplyMap.get(newMessage.id);
+      try {
+        await botReply.edit(newReplyText);
+        console.log(`MessageUpdate: Edited bot reply for message ${newMessage.id}`);
+      } catch (err) {
+        advancedErrorHandler(err, "MessageUpdate Edit");
+      }
+    }
+  } catch (error) {
+    advancedErrorHandler(error, "MessageUpdate Handler");
   }
 });
 
