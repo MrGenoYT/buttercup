@@ -1581,23 +1581,14 @@ app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
  * DISCORD BOT - Minor Section 4: AUTO-RETRY LOGIN FUNCTIONALITY
  ********************************************************************/
 async function startBot() {
-  let retries = 0;
-  const maxRetries = 5;
-  while (retries < maxRetries) {
+  while (true) {
     try {
       await client.login(DISCORD_TOKEN);
-      console.log("startBot: Bot logged in successfully.");
       break;
     } catch (error) {
       advancedErrorHandler(error, "Login");
-      retries++;
-      console.log(`startBot: Retry attempt ${retries} of ${maxRetries}.`);
-      await new Promise(resolve => setTimeout(resolve, 10000)); // Retry every 10 seconds
+      await new Promise(resolve => setTimeout(resolve, 10000));
     }
-  }
-  if (retries === maxRetries) {
-    console.error("startBot: Failed to login after maximum retries. Exiting.");
-    process.exit(1);
   }
 }
 
