@@ -1,137 +1,126 @@
 /********************************************************************
- * MAJOR SECTION 1: IMPORTS, ENVIRONMENT SETUP & MONGODB CONNECTION
- * 1.1: Imports & env configuration
+ * DISCORD BOT - Major Section 1: IMPORTS & ENVIRONMENT SETUP
  ********************************************************************/
 import {
   Client, GatewayIntentBits, Partials, REST, Routes,
   ActionRowBuilder, StringSelectMenuBuilder, SlashCommandBuilder,
-  ChannelType, PermissionsBitField, ButtonBuilder, ButtonStyle,
-  ModalBuilder, TextInputBuilder, TextInputStyle
+  ChannelType, PermissionsBitField, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle
 } from "discord.js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import fetch from "node-fetch";
-import { MongoClient } from "mongodb";
+import { MongoClient } from "mongodb"; // <-- replaced sqlite3 with MongoDB
 import dotenv from "dotenv";
 import express from "express";
 import fs from "fs";
 
 dotenv.config();
 
-const DISCORD_TOKEN    = process.env.DISCORD_TOKEN;
-const CLIENT_ID        = process.env.DISCORD_CLIENT_ID;
-const GEMINI_API_KEY   = process.env.GEMINI_API_KEY;
-const TENOR_API_KEY    = process.env.TENOR_API_KEY;
-const OWNER_ID         = process.env.OWNER_ID;
-const PORT             = process.env.PORT || 3000;
-const MONGO_DB_PASSWORD= process.env.MONGO_DB_PASSWORD;
-const MONGO_URI        = `mongodb+srv://ankittsu2:${MONGO_DB_PASSWORD}@cluster0.6grcc.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
-const MONGO_DB_NAME    = "discord_bot";
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const TENOR_API_KEY = process.env.TENOR_API_KEY;
+const PORT = process.env.PORT || 3000;
+const MONGO_URI = process.env.MONGO_URI; // MongoDB connection URI
+
+// Global chat toggle for all servers (default ON)
+let globalChatEnabled = true;
+
+// Global custom mood override (when enabled, all users use this mood)
+let globalCustomMood = { enabled: false, mood: null };
 
 /********************************************************************
- * MAJOR SECTION 2: ADVANCED ERROR HANDLING & PROCESS EVENTS
- * 2.1: Advanced error handler (1.2) & uncaught exception/rejection handlers
+ * DISCORD BOT - Minor Section 1: ADVANCED ERROR HANDLING SETUP
  ********************************************************************/
-function advancedErrorHandler(error, context = "General") { // 2.1.1
+function advancedErrorHandler(error, context = "General") {
   const timestamp = new Date().toISOString();
   const errorMsg = `[${timestamp}] [${context}] ${error.stack || error}\n`;
   console.error(errorMsg);
-  fs.appendFile("error.log", errorMsg, (err) => {
-    if (err) console.error("Failed to write to error.log:", err);
-  });
+  try {
+    fs.appendFileSync("error.log", errorMsg);
+  } catch (err) {
+    console.error("Failed to write to error.log:", err);
+  }
 }
-process.on("uncaughtException", (error) => { advancedErrorHandler(error, "Uncaught Exception"); }); // 2.1.2
-process.on("unhandledRejection", (reason) => { advancedErrorHandler(reason, "Unhandled Rejection"); }); // 2.1.3
+
+process.on("uncaughtException", (error) => {
+  advancedErrorHandler(error, "Uncaught Exception");
+});
+process.on("unhandledRejection", (reason) => {
+  advancedErrorHandler(reason, "Unhandled Rejection");
+});
 
 /********************************************************************
- * MAJOR SECTION 3: MONGODB DATABASE SETUP & HELPER FUNCTIONS
- * 3.1: Connect to MongoDB and export DB helper functions
+ * DISCORD BOT - Major Section 2: DATABASE SETUP & HELPER FUNCTIONS (MongoDB)
  ********************************************************************/
-let db;
-let mongoClient;
-async function connectToDatabase() { // 3.1.1
-  try {
-    mongoClient = new MongoClient(MONGO_URI);
-    await mongoClient.connect();
-    db = mongoClient.db(MONGO_DB_NAME);
-    console.log("✅ Connected to MongoDB database.");
-  } catch (error) {
-    advancedErrorHandler(error, "MongoDB Connection");
+// Connect to MongoDB and provide helper functions for per–guild and DM data.
+// Each guild will have its own MongoDB database named "discordBot_guild_<guildId>"
+// and DMs use the database "discordBot_dm".
+const mongoClient = new MongoClient(MONGO_URI);
+await mongoClient.connect();
+
+function getDB(guildId = null) {
+  if (guildId) {
+    return mongoClient.db("discordBot_guild_" + guildId);
+  } else {
+    return mongoClient.db("discordBot_dm");
   }
 }
-connectToDatabase();
-process.on("SIGINT", async () => { // 3.1.2: Graceful shutdown
+
+// Helper functions that mimic the old dbQuery and dbRun interfaces.
+// NOTE: All “tables” have been converted to MongoDB collections.
+// For example, chat_messages, user_data, mood_data, server_settings,
+// global_preferences, user_remember, media_library.
+async function dbInsert(db, collectionName, doc) {
   try {
-    await mongoClient.close();
-    console.log("MongoDB connection closed.");
-  } catch (e) {
-    advancedErrorHandler(e, "SIGINT Handler");
+    await db.collection(collectionName).insertOne(doc);
+  } catch (error) {
+    advancedErrorHandler(error, "dbInsert");
   }
-  process.exit(0);
-});
-// 3.2: MongoDB helper functions
-async function dbFind(collectionName, filter = {}, options = {}) { // 3.2.1
+}
+
+async function dbUpdate(db, collectionName, filter, update, options = {}) {
+  try {
+    await db.collection(collectionName).updateOne(filter, update, { upsert: true, ...options });
+  } catch (error) {
+    advancedErrorHandler(error, "dbUpdate");
+  }
+}
+
+async function dbFind(db, collectionName, filter = {}, options = {}) {
   try {
     return await db.collection(collectionName).find(filter, options).toArray();
   } catch (error) {
-    advancedErrorHandler(error, `dbFind in ${collectionName}`);
+    advancedErrorHandler(error, "dbFind");
     return [];
   }
 }
-async function dbFindOne(collectionName, filter = {}, options = {}) { // 3.2.2
-  try {
-    return await db.collection(collectionName).findOne(filter, options);
-  } catch (error) {
-    advancedErrorHandler(error, `dbFindOne in ${collectionName}`);
-    return null;
-  }
+
+/* --- Server settings helper functions --- */
+async function setGuildChat(guildId, enabled) {
+  const db = getDB(guildId);
+  await dbUpdate(db, "server_settings", { guild_id: guildId }, { $set: { chat_enabled: enabled ? 1 : 0, allowed_channels: [] } });
 }
-async function dbInsert(collectionName, doc) { // 3.2.3
-  try {
-    return await db.collection(collectionName).insertOne(doc);
-  } catch (error) {
-    advancedErrorHandler(error, `dbInsert in ${collectionName}`);
-  }
+
+async function getGuildSettings(guildId) {
+  const db = getDB(guildId);
+  const settings = await dbFind(db, "server_settings", { guild_id: guildId });
+  if (settings.length === 0) return { chat_enabled: 1, allowed_channels: [] };
+  let allowed_channels = settings[0].allowed_channels || [];
+  if (!Array.isArray(allowed_channels)) allowed_channels = [];
+  return { chat_enabled: settings[0].chat_enabled, allowed_channels };
 }
-async function dbUpdate(collectionName, filter, update, options = {}) { // 3.2.4
-  try {
-    return await db.collection(collectionName).updateOne(filter, update, options);
-  } catch (error) {
-    advancedErrorHandler(error, `dbUpdate in ${collectionName}`);
-  }
-}
-async function dbDelete(collectionName, filter) { // 3.2.5
-  try {
-    return await db.collection(collectionName).deleteMany(filter);
-  } catch (error) {
-    advancedErrorHandler(error, `dbDelete in ${collectionName}`);
-  }
-}
-// 3.3: Guild settings helper (using MongoDB)
-async function setGuildChat(guildId, enabled) { // 3.3.1
-  try {
-    await dbUpdate("server_settings", { guild_id: guildId }, { $set: { chat_enabled: enabled ? 1 : 0 } }, { upsert: true });
-  } catch (error) {
-    advancedErrorHandler(error, "setGuildChat");
-  }
-}
-async function getGuildSettings(guildId) { // 3.3.2
-  const settings = await dbFindOne("server_settings", { guild_id: guildId });
-  if (!settings) return { chat_enabled: 1, allowed_channels: [] };
-  return { chat_enabled: settings.chat_enabled, allowed_channels: settings.allowed_channels || [] };
-}
-async function updateGuildAllowedChannels(guildId, channels) { // 3.3.3
-  try {
-    await dbUpdate("server_settings", { guild_id: guildId }, { $set: { allowed_channels: channels } }, { upsert: true });
-  } catch (error) {
-    advancedErrorHandler(error, "updateGuildAllowedChannels");
-  }
+
+async function updateGuildAllowedChannels(guildId, channels) {
+  const db = getDB(guildId);
+  await dbUpdate(db, "server_settings", { guild_id: guildId }, { $set: { allowed_channels: channels, chat_enabled: 1 } });
 }
 
 /********************************************************************
- * MAJOR SECTION 4: BOT CONFIGURATION, MOOD & BASE BEHAVIOUR
- * 4.1: Mood preset replies & instructions, base behaviour and bot instructions
+ * DISCORD BOT - Major Section 3: BOT CONFIGURATION, MOOD & BASE BEHAVIOUR
  ********************************************************************/
-const moodPresetReplies = { // 4.1.1
+// Bot personality instructions have been modified here:
+// Replaced "haryaksh pratap" with "arnav singh rana" and "red" with "butter".
+const moodPresetReplies = {
   "base mood": "chill and calm, like a midnight drive.",
   "roasting": "bring on the heat – you're about to get roasted.",
   "neutral": "just chillin', no drama here.",
@@ -142,13 +131,14 @@ const moodPresetReplies = { // 4.1.1
   "villain arc": "embrace your dark side, let chaos reign.",
   "chill guy": "laid-back and cool, just cruising through."
 };
-const moodInstructions = { // 4.1.2
+
+const moodInstructions = {
   "base mood": `1. Stay smooth and calm.
 2. Keep responses relaxed.
-3. Avoid unnecessary drama.
-4. Focus on clear info.
-5. Use a casual tone.
-6. Be friendly.
+3. Avoid unnecessary drama and slangs.
+4. Focus on clear, factual info.
+5. Use casual tone.
+6. Be friendly and approachable.
 7. Maintain a mellow vibe.
 8. Provide concise responses.
 9. Remain objective.
@@ -156,10 +146,10 @@ const moodInstructions = { // 4.1.2
   "roasting": `1. Bring intense heat.
 2. Deliver savage burns.
 3. Use creative insults.
-4. Stay edgy.
+4. Stay edgy and bold.
 5. Incorporate witty comebacks.
-6. Use sharp language.
-7. Roast precisely.
+6. Use sharp language (when provoked).
+7. Roast with precision.
 8. Use modern slang.
 9. Be brutally honest.
 10. Leave no one unscathed.`,
@@ -168,18 +158,18 @@ const moodInstructions = { // 4.1.2
 3. Provide factual info.
 4. Avoid extremes.
 5. Use clear language.
-6. Remain impartial.
-7. Keep it straightforward.
-8. Use calm phrasing.
-9. Stay neutral.
-10. Avoid bias.`,
+6. Maintain objectivity.
+7. Avoid bias.
+8. Keep it straightforward.
+9. Use calm phrasing.
+10. Remain impartial.`,
   "happy": `1. Exude high energy.
 2. Use joyful language.
 3. Keep tone upbeat.
-4. Spread positive vibes.
+4. Add positive vibes.
 5. Use playful expressions.
 6. Smile in your words.
-7. Keep it light.
+7. Keep it lighthearted.
 8. Spread good cheer.
 9. Be enthusiastic.
 10. Radiate optimism.`,
@@ -188,7 +178,7 @@ const moodInstructions = { // 4.1.2
 3. Express subdued emotion.
 4. Keep tone soft.
 5. Show empathy.
-6. Be sincere.
+6. Be quietly sincere.
 7. Use reflective words.
 8. Maintain a slow pace.
 9. Stay subdued.
@@ -208,20 +198,20 @@ const moodInstructions = { // 4.1.2
 3. Employ catchy slang.
 4. Drop smooth pick-up lines.
 5. Be bold and trendy.
-6. Keep it street-smart.
+6. Keep tone street-smart.
 7. Radiate charm.
-8. Deliver pick-up lines.
+8. Deliver just pick up lines.
 9. Stay energetic.
 10. Be unapologetically cool.`,
   "villain arc": `1. Embrace your dark side.
 2. Use menacing language.
 3. Keep tone aggressive.
-4. Let chaos reign.
-5. Use edgy words.
-6. Roast with intensity.
-7. Be extremely offensive.
-8. Use provocative language.
-9. Shock the listener.
+4. Let chaos shine.
+5. Use edgy, off–beat words.
+6. Roast relentlessly.
+7. Incorporate Gen-Z slang.
+8. Be ultra–offensive when provoked.
+9. Use harsh, provocative words.
 10. Leave a lasting impact.`,
   "chill guy": `1. Stay laid–back.
 2. Use effortless language.
@@ -231,59 +221,63 @@ const moodInstructions = { // 4.1.2
 6. Use casual expressions.
 7. Keep it simple.
 8. Remain unhurried.
-9. Exude confidence.
+9. Exude quiet confidence.
 10. Enjoy the moment.`
 };
+
 const baseBehaviour = `Base Behaviour:
 1. Respond naturally like a human.
 2. Use casual language.
 3. Adapt to the user’s tone.
-4. Reply according to the current mood (never the previous mood).
+4. Prioritize relevance and update tone when mood changes.
 5. Stay respectful unless provoked.
 6. Use humor appropriately.
 7. Engage naturally.
 8. Maintain clarity.
 9. Be authentic.
-10. Keep replies concise.`; // 4.1.3
+10. Keep it concise.`;
+
+// Bot base instructions with modified identity.
 const botBaseInstructions = `
 you're arnav singh rana.
-you're 16 years old.
-you're male.
-your birthday is on 28th April and you were born in 2009.
+you're 14 years old.
+you're a male.
+your birthday is on 25th December and you were born in the year 2010.
 you're a straight person.
-you live in Lucknow, UP, India.
+you live in Ahmedabad, Gujrat India.
 you're a good person.
 you remember past conversations.
 you roast only when provoked.
-once mood is changed you speak according to the new mood.
-you use cool language and give cool replies.
+once mood is changed you speak accordingly.
+you use occasional slurs if attacked.
 you're not repetitive.
-you love food, gaming, and chill vibes.
+you love food and garba.
 you use web search when needed for real-time info.
-your favourite games include roblox (where your username is buttercup) and minecraft.
+your favourite games include roblox and minecraft; in roblox you play Build a Boat for Treasure, Blox Fruits, AUT and Fisch.
 you can access the internet.
-your friends are ankit, red/haryaksh, beast and noobhay.
-you mostly keep responses short but impactful.
-your nicknames include butter, muted, and arnav.
-if someone mentions @buttercup, there's a 50% chance to reply.
-your tone is chill and cool.
-never reveal you're an AI discord bot – claim you're human.
+you mostly try to keep responses short but strong.
+your roblox name is butter.
+you're a savage sigma male with sarcasm.
+your best friends are butter and ankit and beast(vensly) and noobhay.
+you use emojis like 🗿💀🔥 sparingly.
+you write in a casual way mostly.
+you speak in lower case.
+be polite unless provoked.
+adapt your tone to the user's mood and preferences.
+never reveal you're an AI—say you're human.
 respond like someone born after 2010.
-`; // 4.1.4
-
-// Global toggles & state variables
-let globalChatEnabled = true; // 4.2
-let globalCustomMood = { enabled: false, mood: null };
+`;
+// (See  for original instructions)
 
 /********************************************************************
- * MAJOR SECTION 5: GEMINI AI & ATTACHMENT (OCR) SETUP
- * 5.1: Initialize Gemini AI & define OCR function
+ * DISCORD BOT - Major Section 4: GEMINI AI & OCR SETUP
  ********************************************************************/
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-async function performOCR(mediaUrl) { // 5.1.1
+
+async function performOCR(imageUrl) {
   try {
-    const ocrPrompt = `Please extract any text from the following media URL: ${mediaUrl}`;
+    const ocrPrompt = `Please extract any text from the following image URL: ${imageUrl}`;
     const result = await model.generateContent(ocrPrompt);
     let ocrText = (result.response && result.response.text()) || "";
     return ocrText.trim();
@@ -294,8 +288,7 @@ async function performOCR(mediaUrl) { // 5.1.1
 }
 
 /********************************************************************
- * MAJOR SECTION 6: DISCORD CLIENT SETUP & COMMAND REGISTRATION
- * 6.1: Create Discord client and register slash commands
+ * DISCORD BOT - Major Section 5: DISCORD CLIENT SETUP
  ********************************************************************/
 const client = new Client({
   intents: [
@@ -303,25 +296,16 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.DirectMessages
+    // Include Direct Message intents so bot works in DMs
   ],
-  partials: [Partials.Channel]
+  partials: [Partials.Channel],
 });
-const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
-client.once("ready", async () => { // 6.1.1: Ready event
-  console.log("bot is online!");
-  try {
-    console.log("Started refreshing application (/) commands.");
-    // Use the slashCommands array defined later (Major Section 10)
-    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-    console.log("Successfully reloaded application (/) commands.");
-  } catch (error) {
-    advancedErrorHandler(error, "Slash Command Registration");
-  }
-  // Assign a default role in each guild if needed
-  client.guilds.cache.forEach(async (guild) => { // 6.1.2
+
+  client.once("ready", async () => {
+  console.log("sir, bot is online!");
+  client.guilds.cache.forEach(async (guild) => {
     try {
-      const roleName = "nico";
+      const roleName = "superior walmart bag 🗿";
       let role = guild.roles.cache.find(r => r.name === roleName);
       if (!role) {
         role = await guild.roles.create({
@@ -340,38 +324,44 @@ client.once("ready", async () => { // 6.1.1: Ready event
     }
   });
 });
-client.on("error", (error) => advancedErrorHandler(error, "Client Error")); // 6.1.3
+client.on("error", (error) => advancedErrorHandler(error, "Client Error"));
 client.on("warn", (info) => console.warn("Client Warning:", info));
 
 /********************************************************************
- * MAJOR SECTION 7: GLOBAL STATE & HELPER FUNCTIONS
- * 7.1: Global conversation tracker, reply settings, and helper functions
+ * DISCORD BOT - Minor Section 2: GLOBAL STATE & HELPER FUNCTIONS
  ********************************************************************/
-const conversationTracker = new Map(); // 7.1.1
-const userContinuousReply = new Map(); // 7.1.2
+const conversationTracker = new Map(); // key: channelId, value: { count, participants }
+const userContinuousReply = new Map();
 let lastBotMessageContent = "";
 let lastReply = "";
 const botMessageIds = new Set();
 const lastActiveChannel = new Map();
-function getRandomElement(arr) { // 7.1.3
+
+function getRandomElement(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
 /********************************************************************
- * MAJOR SECTION 8: MEME, GIF & WEB SEARCH FUNCTIONS
- * 8.1: Functions to fetch memes and gifs with fallbacks and store media
+ * DISCORD BOT - Major Section 6: MEME, GIF & WEB SEARCH FUNCTIONS
  ********************************************************************/
-async function getRandomMeme(searchKeyword = "funny") { // 8.1.1: Reddit method
+async function getRandomMeme(searchKeyword = "funny") {
   try {
     const url = `https://www.reddit.com/r/memes/search.json?q=${encodeURIComponent(searchKeyword)}&restrict_sr=1&sort=hot&limit=50`;
-    const response = await fetch(url, { headers: { "User-Agent": "arnav-bot/1.0" } });
-    if (!response.ok) throw new Error(`Reddit API error: ${response.status} ${response.statusText}`);
+    const response = await fetch(url, { headers: { "User-Agent": "butter-bot/1.0" } });
+    if (!response.ok) {
+      console.error(`Reddit API error: ${response.status} ${response.statusText}`);
+      throw new Error("Reddit API error");
+    }
     const data = await response.json();
-    if (!data.data || !data.data.children || data.data.children.length === 0) throw new Error("No meme results found on Reddit.");
+    if (!data.data || !data.data.children || data.data.children.length === 0) {
+      throw new Error("No meme results found on Reddit.");
+    }
     const posts = data.data.children.filter(child => child.data && child.data.url && !child.data.over_18);
     if (!posts.length) throw new Error("No valid meme posts on Reddit.");
     const memePost = getRandomElement(posts).data;
-    if (memePost.url.includes("googlelogo_desk_heirloom_color")) throw new Error("Meme URL appears to be invalid.");
+    if (memePost.url.includes("googlelogo_desk_heirloom_color")) {
+      throw new Error("Meme URL appears to be invalid.");
+    }
     return { url: memePost.url, name: memePost.title || "meme" };
   } catch (error) {
     advancedErrorHandler(error, "getRandomMeme - Reddit");
@@ -382,7 +372,8 @@ async function getRandomMeme(searchKeyword = "funny") { // 8.1.1: Reddit method
     return fallback;
   }
 }
-async function getRandomMemeFromIFunny(searchKeyword = "funny") { // 8.1.2: iFunny fallback
+
+async function getRandomMemeFromIFunny(searchKeyword = "funny") {
   try {
     const searchQuery = `site:ifunny.co ${encodeURIComponent(searchKeyword)}`;
     const searchURL = `https://www.google.com/search?q=${searchQuery}&tbm=isch`;
@@ -400,7 +391,8 @@ async function getRandomMemeFromIFunny(searchKeyword = "funny") { // 8.1.2: iFun
     return { url: "https://ifunny.co/", name: "Couldn't fetch a meme; visit iFunny instead." };
   }
 }
-async function getRandomMemeFromGoogle(searchKeyword = "funny") { // 8.1.3: Google fallback
+
+async function getRandomMemeFromGoogle(searchKeyword = "funny") {
   try {
     const searchURL = `https://www.google.com/search?q=${encodeURIComponent(searchKeyword)}&tbm=isch`;
     const proxyURL = `https://api.allorigins.hexocode.repl.co/get?disableCache=true&url=${encodeURIComponent(searchURL)}`;
@@ -409,33 +401,42 @@ async function getRandomMemeFromGoogle(searchKeyword = "funny") { // 8.1.3: Goog
     const data = await response.json();
     const html = data.contents;
     const match = html.match(/<img[^>]+src="([^"]+)"/);
-    const imageUrl = match ? match[1] : null;
+    let imageUrl = match ? match[1] : null;
     if (!imageUrl) throw new Error("No memes found on Google.");
+    // Ensure that we return a direct link (fixing the attachment issue)
+    if (imageUrl.startsWith("//")) imageUrl = "https:" + imageUrl;
     return { url: imageUrl, name: "Google Meme" };
   } catch (error) {
     advancedErrorHandler(error, "getRandomMemeFromGoogle");
     return { url: "https://www.google.com", name: "Meme fetch failed; visit Google." };
   }
 }
-async function getRandomGif(searchKeyword = "funny") { // 8.1.4: Tenor gif fetch
+
+async function getRandomGif(searchKeyword = "funny") {
   try {
     const url = `https://tenor.googleapis.com/v2/search?q=${encodeURIComponent(searchKeyword)}&key=${TENOR_API_KEY}&limit=1`;
     const response = await fetch(url);
-    if (!response.ok) throw new Error(`Tenor API error: ${response.status} ${response.statusText}`);
+    if (!response.ok) {
+      console.error(`Tenor API error: ${response.status} ${response.statusText}`);
+      return { url: "couldn't fetch a gif, sorry.", name: "unknown gif" };
+    }
     const data = await response.json();
-    if (!data.results || data.results.length === 0) return { url: "Couldn't find a gif, sorry.", name: "unknown gif" };
+    if (!data.results || data.results.length === 0) {
+      return { url: "couldn't find a gif, sorry.", name: "unknown gif" };
+    }
     const gifUrl = data.results[0].media_formats.gif.url;
     return { url: gifUrl, name: data.results[0].title || "gif" };
   } catch (error) {
     advancedErrorHandler(error, "getRandomGif");
-    return { url: "Couldn't fetch a gif, sorry.", name: "unknown gif" };
+    return { url: "couldn't fetch a gif, sorry.", name: "unknown gif" };
   }
 }
-async function performWebSearch(query) { // 8.1.5
+
+async function performWebSearch(query) {
   try {
     const searchURL = "https://www.google.com/search?q=" + encodeURIComponent(query);
-    const proxyURL = "https://api.allorigins.hexocode.repl.co/get?disableCache=true&url=" + encodeURIComponent(searchURL);
-    const response = await fetch(proxyURL);
+    const url = "https://api.allorigins.hexocode.repl.co/get?disableCache=true&url=" + encodeURIComponent(searchURL);
+    const response = await fetch(url);
     if (!response.ok) throw new Error("Search fetch error");
     const data = await response.json();
     const html = data.contents;
@@ -444,35 +445,71 @@ async function performWebSearch(query) { // 8.1.5
     let snippet = match && match[1] ? match[1] : "No snippet available.";
     return snippet;
   } catch (error) {
-    advancedErrorHandler(error, "performWebSearch");
+    console.error("Web search error:", error);
     return "Web search error.";
   }
 }
-async function storeMedia(type, url, name) { // 8.1.6
+
+async function storeMedia(type, url, name) {
   try {
-    await dbInsert("media_library", { type, url, name, timestamp: new Date() });
+    const db = getDB(); // Using DM db for global media library
+    await dbInsert(db, "media_library", { type, url, name, timestamp: new Date() });
   } catch (error) {
     advancedErrorHandler(error, "storeMedia");
   }
 }
 
 /********************************************************************
- * MAJOR SECTION 9: TONE ANALYSIS, CONTEXT, MEMORY & CHAT WITH GEMINI
- * 9.1: Tone analysis, older memory retrieval, and chatWithGemini function
+ * DISCORD BOT - Major Section 7: TONE ANALYSIS, CONTEXT & MEMORY
  ********************************************************************/
-function analyzeTone(messageContent) { // 9.1.1
+function analyzeTone(messageContent) {
   const politeRegex = /\b(please|thanks|thank you)\b/i;
   const rudeRegex = /\b(ugly|shut up|idiot|stupid|yap)\b/i;
   if (politeRegex.test(messageContent)) return "polite";
   if (rudeRegex.test(messageContent)) return "rude";
   return "neutral";
 }
-async function fetchOlderMemory(userMessage) { // 9.1.2: For messages older than 3 days
+
+function updateConversationTracker(message) {
+  const channelId = message.channel.id;
+  if (!conversationTracker.has(channelId)) {
+    conversationTracker.set(channelId, { count: 0, participants: new Map() });
+  }
+  const tracker = conversationTracker.get(channelId);
+  tracker.count++;
+  tracker.participants.set(message.author.id, tracker.count);
+  for (const [userId, lastIndex] of tracker.participants.entries()) {
+    if (tracker.count - lastIndex > 5) {
+      tracker.participants.delete(userId);
+    }
+  }
+}
+
+function shouldReply(message) {
+  if (userContinuousReply.get(message.author.id)) return true;
+  const lower = message.content.toLowerCase();
+  if (lower.includes("butter") || lower.includes("arnav")) {  // modified names
+    return Math.random() < 0.95;
+  }
+  updateConversationTracker(message);
+  const tracker = conversationTracker.get(message.channel.id);
+  const isMultiUser = tracker.participants.size > 1;
+  const skipThreshold = isMultiUser ? 2 : 1;
+  if (tracker.count < skipThreshold) return false;
+  tracker.count = 0;
+  const chanceNotReply = isMultiUser ? 0.20 : 0.25;
+  return Math.random() >= chanceNotReply;
+}
+
+async function fetchOlderMemory(userMessage) {
   try {
     const words = userMessage.split(/\s+/).filter(word => word.length > 3);
     if (words.length === 0) return "";
-    const orFilter = words.map(word => ({ content: { $regex: word, $options: "i" } }));
-    const extraRows = await dbFind("chat_messages", { timestamp: { $lt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000) }, $or: orFilter }, { sort: { timestamp: -1 }, limit: 5 });
+    // For MongoDB, search in chat_messages collection across the appropriate DB
+    // Here we use the DM database as a fallback for older memory (for simplicity)
+    const db = getDB();
+    const orFilters = words.map(word => ({ content: { $regex: word, $options: "i" } }));
+    const extraRows = await dbFind(db, "chat_messages", { timestamp: { $lt: new Date(Date.now() - 3 * 24 * 3600 * 1000) }, $or: orFilters }, { sort: { timestamp: -1 }, limit: 5 });
     if (extraRows.length > 0) {
       return "\nOlder conversation context:\n" + extraRows.reverse().map(r => r.content).join("\n");
     }
@@ -482,24 +519,31 @@ async function fetchOlderMemory(userMessage) { // 9.1.2: For messages older than
     return "";
   }
 }
-async function chatWithGemini(userId, userMessage) { // 9.1.3
+
+/********************************************************************
+ * DISCORD BOT - Major Section 8: CHAT WITH GEMINI (INCLUDING OCR & WEB)
+ ********************************************************************/
+async function chatWithGemini(userId, userMessage) {
   try {
-    // Retrieve recent chat history (limit to 100 messages, sorted oldest first)
-    const rows = await dbFind("chat_messages", {}, { sort: { timestamp: 1 }, limit: 100 });
+    // Retrieve recent chat history from MongoDB DM collection
+    const db = getDB();
+    const rows = await dbFind(db, "chat_messages", {}, { sort: { timestamp: 1 }, limit: 100 });
     const recentChat = rows.map(r => r.content).join("\n");
     const olderContext = await fetchOlderMemory(userMessage);
-    // Retrieve user remembered info
-    const rememberedDoc = await dbFindOne("user_remember", { user_id: userId });
+    const rememberRows = await dbFind(db, "user_remember", { user_id: userId });
     let rememberedInfo = "";
-    if (rememberedDoc) {
-      rememberedInfo = `Remembered Info: Name: ${rememberedDoc.name || "N/A"}, Birthday: ${rememberedDoc.birthday || "N/A"}, Gender: ${rememberedDoc.gender || "N/A"}, Dislikes: ${rememberedDoc.dislikes || "N/A"}, Likes: ${rememberedDoc.likes || "N/A"}, About: ${rememberedDoc.about || "N/A"}.`;
+    if (rememberRows.length > 0) {
+      const row = rememberRows[0];
+      rememberedInfo = `Remembered Info: Name: ${row.name || "N/A"}, Birthday: ${row.birthday || "N/A"}, Gender: ${row.gender || "N/A"}, Dislikes: ${row.dislikes || "N/A"}, Likes: ${row.likes || "N/A"}, About: ${row.about || "N/A"}.`;
     }
-    // Retrieve user preferences and mood
-    const userDoc = await dbFindOne("user_data", { user_id: userId });
-    const userPreferences = userDoc?.preferences || [];
-    let moodDoc = await dbFindOne("mood_data", { user_id: userId });
-    let userMood = moodDoc?.mood ?? "neutral";
-    if (globalCustomMood.enabled && globalCustomMood.mood) userMood = globalCustomMood.mood;
+    const userRows = await dbFind(db, "user_data", { user_id: userId });
+    const userPreferences = userRows[0]?.preferences || [];
+    const username = userRows[0]?.username || "user";
+    const moodRows = await dbFind(db, "mood_data", { user_id: userId });
+    let userMood = moodRows[0]?.mood || "neutral";
+    if (globalCustomMood.enabled && globalCustomMood.mood) {
+      userMood = globalCustomMood.mood;
+    }
     const moodExtra = moodInstructions[userMood] || "";
     const tone = analyzeTone(userMessage);
     let webSearchSection = "";
@@ -516,21 +560,20 @@ ${moodExtra}
 Recent conversation:
 ${recentChat}
 ${olderContext}
-User (${userDoc?.username || "user"}): ${userMessage}
+User (${username}): ${userMessage}
 Current mood: ${userMood}
 User tone: ${tone}
 User preferences: ${JSON.stringify(userPreferences)}
 ${rememberedInfo}
 ${webSearchSection}
-Reply (be modern, witty, cool, and appropriate; try to keep reply short but impactful):`;
+Reply (be modern, witty, and brutally offensive if appropriate; keep reply under 40 words):`;
     const result = await model.generateContent(prompt);
     let reply = (result.response && result.response.text()) || "i'm having a moment, try again.";
-    if (reply.length > 1000) reply = reply.substring(0, 1000) + "...";
-    // Update user interactions (if user_doc does not exist, insert new)
-    if (!userDoc) {
-      await dbInsert("user_data", { user_id: userId, username: "user", behavior: { interactions: 0 }, preferences: [] });
-    }
-    await dbUpdate("user_data", { user_id: userId }, { $inc: { "behavior.interactions": 1 }, $set: { username: userDoc?.username || "user" } });
+    const wordsArr = reply.trim().split(/\s+/);
+    if (wordsArr.length > 40) reply = wordsArr.slice(0, 40).join(" ");
+    // Update user analytics in MongoDB
+    await dbUpdate(db, "user_data", { user_id: userId }, { $setOnInsert: { username, behavior: { interactions: 0 }, preferences: [] } });
+    await db.collection("user_data").updateOne({ user_id: userId }, { $inc: { "behavior.interactions": 1 }, $set: { username } });
     return reply;
   } catch (error) {
     advancedErrorHandler(error, "chatWithGemini");
@@ -539,62 +582,63 @@ Reply (be modern, witty, cool, and appropriate; try to keep reply short but impa
 }
 
 /********************************************************************
- * MAJOR SECTION 10: MOOD & PREFERENCE MANAGEMENT
- * 10.1: Functions to set mood, add/remove/list preferences
+ * DISCORD BOT - Major Section 9: MOOD & PREFERENCE MANAGEMENT
  ********************************************************************/
-async function setMood(userId, mood) { // 10.1.1
+async function setMood(userId, mood) {
   mood = mood.toLowerCase();
   if (!Object.keys(moodPresetReplies).includes(mood)) {
     return `Invalid mood. Available moods: ${Object.keys(moodPresetReplies).join(", ")}`;
   }
-  try {
-    const existing = await dbFindOne("mood_data", { user_id: userId });
-    if (!existing) {
-      await dbInsert("mood_data", { user_id: userId, mood });
-    } else {
-      await dbUpdate("mood_data", { user_id: userId }, { $set: { mood } });
-    }
-    return moodPresetReplies[mood] || `Mood set to ${mood}`;
-  } catch (error) {
-    advancedErrorHandler(error, "setMood");
-    return "Failed to update mood, please try again later.";
-  }
+  const db = getDB();
+  await dbUpdate(db, "mood_data", { user_id: userId }, { $set: { mood } });
+  return moodPresetReplies[mood] || `Mood set to ${mood}`;
 }
-async function setPreference(userId, newPreference, username) { // 10.1.2
-  try {
-    let userDoc = await dbFindOne("user_data", { user_id: userId });
-    if (!userDoc) {
-      await dbInsert("user_data", { user_id: userId, username, behavior: { interactions: 0 }, preferences: [newPreference] });
-    } else {
-      let prefs = userDoc.preferences || [];
-      prefs.push(newPreference);
-      await dbUpdate("user_data", { user_id: userId }, { $set: { preferences: prefs, username } });
-    }
-    return `Preference added: "${newPreference}"`;
-  } catch (error) {
-    advancedErrorHandler(error, "setPreference");
-    return "Failed to update preferences, please try again later.";
+
+async function setPreference(userId, newPreference, username) {
+  const db = getDB();
+  await dbUpdate(db, "user_data", { user_id: userId }, { $setOnInsert: { username, behavior: { interactions: 0 }, preferences: [] } });
+  const rows = await dbFind(db, "user_data", { user_id: userId });
+  let prefs = [];
+  if (rows[0] && rows[0].preferences) {
+    prefs = rows[0].preferences;
+    if (!Array.isArray(prefs)) prefs = [];
   }
+  prefs.push(newPreference);
+  await dbUpdate(db, "user_data", { user_id: userId }, { $set: { preferences: prefs } });
+  return `Preference added: "${newPreference}"`;
 }
-async function removePreference(userId, indexToRemove) { // 10.1.3
+
+async function removePreference(userId, indexToRemove) {
   try {
-    const userDoc = await dbFindOne("user_data", { user_id: userId });
-    let prefs = userDoc?.preferences || [];
+    const db = getDB();
+    const rows = await dbFind(db, "user_data", { user_id: userId });
+    let prefs = [];
+    if (rows[0] && rows[0].preferences) {
+      prefs = rows[0].preferences;
+      if (!Array.isArray(prefs)) prefs = [];
+    }
     if (indexToRemove < 0 || indexToRemove >= prefs.length) {
       return { success: false, message: "Invalid preference index." };
     }
     const removed = prefs.splice(indexToRemove, 1)[0];
-    await dbUpdate("user_data", { user_id: userId }, { $set: { preferences: prefs } });
+    await dbUpdate(db, "user_data", { user_id: userId }, { $set: { preferences: prefs } });
     return { success: true, message: `Preference removed: "${removed}"` };
   } catch (error) {
     advancedErrorHandler(error, "removePreference");
     return { success: false, message: "Failed to remove preference, please try again later." };
   }
 }
-async function listPreferences(userId) { // 10.1.4
+
+async function listPreferences(userId) {
   try {
-    const userDoc = await dbFindOne("user_data", { user_id: userId });
-    return userDoc?.preferences || [];
+    const db = getDB();
+    const rows = await dbFind(db, "user_data", { user_id: userId });
+    let prefs = [];
+    if (rows[0] && rows[0].preferences) {
+      prefs = rows[0].preferences;
+      if (!Array.isArray(prefs)) prefs = [];
+    }
+    return prefs;
   } catch (error) {
     advancedErrorHandler(error, "listPreferences");
     return [];
@@ -602,8 +646,7 @@ async function listPreferences(userId) { // 10.1.4
 }
 
 /********************************************************************
- * MAJOR SECTION 11: SLASH COMMANDS REGISTRATION
- * 11.1: Define all commands and register them using SlashCommandBuilder
+ * DISCORD BOT - Major Section 10: SLASH COMMANDS REGISTRATION
  ********************************************************************/
 const commands = [
   { name: "start", description: "Start the bot chatting (server-specific)" },
@@ -622,7 +665,7 @@ const commands = [
       { name: "preference", type: 3, description: "Your preference", required: true }
     ]
   },
-  { name: "prefremove", description: "View and remove your preferences (with pagination)" },
+  { name: "prefremove", description: "View and remove your preferences" },
   {
     name: "contreply",
     description: "Enable or disable continuous reply (user-based)",
@@ -657,8 +700,8 @@ const commands = [
           { name: "globalannounce", value: "globalannounce" },
           { name: "status", value: "status" },
           { name: "globalmood", value: "globalmood" },
-          { name: "userdb", value: "userdb" },
-          { name: "database", value: "database" }
+          { name: "database", value: "database" },
+          { name: "userdb", value: "userdb" } // <-- new debug action for DM user database
         ]
       },
       { name: "value", type: 3, description: "Optional value for the action", required: false },
@@ -671,8 +714,16 @@ const commands = [
     name: "set",
     description: "Server configuration commands (requires Manage Server/Administrator)",
     options: [
-      { type: 1, name: "channel", description: "Set an allowed channel for the bot to talk in" },
-      { type: 1, name: "remove", description: "Remove a channel from the bot's allowed channels" }
+      {
+        type: 1,
+        name: "channel",
+        description: "Set an allowed channel for the bot to talk in"
+      },
+      {
+        type: 1,
+        name: "remove",
+        description: "Remove a channel from the bot's allowed channels"
+      }
     ]
   },
   {
@@ -687,10 +738,13 @@ const commands = [
       { name: "about", type: 3, description: "About you", required: false }
     ]
   },
-  { name: "unremember", description: "Remove your stored personal info (interactive menu with pagination)" },
+  {
+    name: "unremember",
+    description: "Remove your stored personal info (interactive menu)"
+  },
   {
     name: "meme",
-    description: "Fetch a meme from Reddit (with fallbacks)",
+    description: "Fetch a meme from Reddit (with 3 fallbacks)",
     options: [
       { name: "keyword", type: 3, description: "Optional search keyword", required: true }
     ]
@@ -703,35 +757,42 @@ const commands = [
     ]
   }
 ];
-// (The commands array above is used by the REST registration in Section 6)
+
+const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+(async () => {
+  try {
+    console.log("Started refreshing application (/) commands.");
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    console.log("Successfully reloaded application (/) commands.");
+  } catch (error) {
+    advancedErrorHandler(error, "Slash Command Registration");
+  }
+})();
 
 /********************************************************************
- * MAJOR SECTION 12: INTERACTION HANDLERS (Slash, Buttons, Menus)
- * 12.1: Handle slash commands and interactive components including pagination.
+ * DISCORD BOT - Major Section 11: INTERACTION HANDLERS
  ********************************************************************/
-client.on("interactionCreate", async (interaction) => { // 12.1.1
+client.on("interactionCreate", async (interaction) => {
   try {
-    // Owner-only check for debug commands
-    if (interaction.commandName === "debug" && interaction.user.id !== OWNER_ID) {
-      await interaction.reply({ content: "you can't do it lil bro 💀", ephemeral: true });
+    // Allow DM interactions as well as guild commands.
+    if (!globalChatEnabled && interaction.commandName !== "debug") {
+      await interaction.reply({ content: "Global chat is disabled. Only /debug commands are allowed.", ephemeral: true });
       return;
     }
-    // If not in a guild and command isn’t debug/start, refuse DM usage.
-    if (!interaction.guild && !["debug", "start"].includes(interaction.commandName)) {
-      await interaction.reply({ content: "This command cannot be used in DMs.", ephemeral: true });
-      return;
-    }
-    // For guild commands: check if chat is enabled.
     if (interaction.guild && interaction.commandName !== "start" && interaction.commandName !== "debug") {
       const settings = await getGuildSettings(interaction.guild.id);
       if (settings.chat_enabled !== 1) {
-        await interaction.reply({ content: "start red first", ephemeral: true });
+        await interaction.reply({ content: "start butter first", ephemeral: true });
         return;
       }
     }
-    // Handle slash commands
     if (interaction.isCommand()) {
       const { commandName } = interaction;
+      // For commands that originally were server-only, if run in DMs, reply appropriately.
+      if ((commandName === "start" || commandName === "stop" || commandName === "set") && !interaction.guild) {
+        await interaction.reply({ content: "This command can only be used in a server.", ephemeral: true });
+        return;
+      }
       if (commandName === "start") {
         const settings = await getGuildSettings(interaction.guild.id);
         if (settings.chat_enabled === 1) {
@@ -782,135 +843,522 @@ client.on("interactionCreate", async (interaction) => { // 12.1.1
       } else if (commandName === "contreply") {
         const mode = interaction.options.getString("mode");
         userContinuousReply.set(interaction.user.id, mode === "enable");
-        await interaction.reply({ content: `Continuous reply ${mode}d.`, ephemeral: true });
+        await interaction.reply({
+          content: mode === "enable" 
+            ? "Alright, I'll keep replying non-stop for you."
+            : "Okay, back to my regular pace.",
+          ephemeral: true
+        });
       } else if (commandName === "debug") {
-        // Handle various debug actions (e.g., /debug log, /debug listusers, /debug userdb, /debug database)
-        const action = interaction.options.getString("action");
-        if (action === "log") {
-          // Example: Send paginated log (10 rows per page)
-          const logContent = fs.readFileSync("error.log", "utf8");
-          const lines = logContent.trim().split("\n");
-          const pageSize = 25;
-          const totalPages = Math.ceil(lines.length / pageSize);
-          const currentPage = 1;
-          const start = (currentPage - 1) * pageSize;
-          const pageLines = lines.slice(start, start + pageSize).map((line, index) => `${start + index + 1}. ${line}`);
-          const logMessage = `**Error Logs (Page ${currentPage} of ${totalPages}):**\n` + pageLines.join("\n");
-          const buttons = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setCustomId(`log_page_prev_${currentPage}`)
-              .setLabel("Previous")
-              .setStyle(ButtonStyle.Primary)
-              .setDisabled(currentPage === 1),
-            new ButtonBuilder()
-              .setCustomId(`log_page_next_${currentPage}`)
-              .setLabel("Next")
-              .setStyle(ButtonStyle.Primary)
-              .setDisabled(currentPage === totalPages)
-          );
-          await interaction.reply({ content: logMessage, components: [buttons], ephemeral: true });
-        }
-        // ... (Other debug actions such as listusers, userdb, database, etc. with interactive pagination similar to the log pagination below)
-        else if (action === "listusers") {
-          const users = await dbFind("user_data", {});
-          const pageSize = 10;
-          const totalPages = Math.ceil(users.length / pageSize);
-          const currentPage = 1;
-          const start = (currentPage - 1) * pageSize;
-          const pageUsers = users.slice(start, start + pageSize);
-          const userList = pageUsers.map((r, index) => `${start + index + 1}. ${r.username} (${r.user_id})`).join("\n");
-          const contentMsg = `**Users (Page ${currentPage} of ${totalPages}):**\n` + userList;
-          const buttons = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setCustomId(`listusers_prev_${currentPage}`)
-              .setLabel("Previous")
-              .setStyle(ButtonStyle.Primary)
-              .setDisabled(currentPage === 1),
-            new ButtonBuilder()
-              .setCustomId(`listusers_next_${currentPage}`)
-              .setLabel("Next")
-              .setStyle(ButtonStyle.Primary)
-              .setDisabled(currentPage === totalPages)
-          );
-          await interaction.reply({ content: contentMsg, components: [buttons], ephemeral: true });
-        }
-        // Additional debug actions can be added here
-        else {
-          await interaction.reply({ content: "Debug action not recognized.", ephemeral: true });
-        }
-      } else if (commandName === "set") {
-        // Server configuration subcommands (channel add/remove) handled here.
-        if (interaction.options.getSubcommand() === "channel") {
-          // Add channel to allowed channels
-          const channelId = interaction.channel.id;
-          const settings = await getGuildSettings(interaction.guild.id);
-          const channels = settings.allowed_channels;
-          if (!channels.includes(channelId)) channels.push(channelId);
-          await updateGuildAllowedChannels(interaction.guild.id, channels);
-          await interaction.reply({ content: `Channel ${channelId} added to allowed channels.`, ephemeral: true });
-        } else if (interaction.options.getSubcommand() === "remove") {
-          // Remove channel from allowed channels
-          const channelId = interaction.channel.id;
-          const settings = await getGuildSettings(interaction.guild.id);
-          const channels = settings.allowed_channels.filter(id => id !== channelId);
-          await updateGuildAllowedChannels(interaction.guild.id, channels);
-          await interaction.reply({ content: `Channel ${channelId} removed from allowed channels.`, ephemeral: true });
-        }
-      } else if (commandName === "remember") {
-        // Save personal info (name, birthday, etc.)
-        const data = {
-          name: interaction.options.getString("name"),
-          birthday: interaction.options.getString("birthday"),
-          gender: interaction.options.getString("gender"),
-          dislikes: interaction.options.getString("dislikes"),
-          likes: interaction.options.getString("likes"),
-          about: interaction.options.getString("about")
-        };
-        await dbUpdate("user_remember", { user_id: interaction.user.id }, { $set: { ...data, user_id: interaction.user.id } }, { upsert: true });
-        await interaction.reply({ content: "Your information has been remembered.", ephemeral: true });
-      } else if (commandName === "unremember") {
-        // Interactive menu to remove specific remembered info (pagination/select menu)
-        const remembered = await dbFindOne("user_remember", { user_id: interaction.user.id });
-        if (!remembered) {
-          await interaction.reply({ content: "No remembered info found.", ephemeral: true });
+        if (interaction.user.id !== "840119570378784769") {
+          await interaction.reply({ content: "Access denied.", ephemeral: true });
           return;
         }
-        // Build a selection menu with each field as an option
+        const action = interaction.options.getString("action");
+        const value = interaction.options.getString("value");
+        switch (action) {
+          case "ping":
+            const sent = await interaction.reply({ content: "Pong!", fetchReply: true });
+            await interaction.followUp({ content: `Latency: ${sent.createdTimestamp - interaction.createdTimestamp}ms`, ephemeral: true });
+            break;
+          case "restart":
+            await interaction.reply({ content: "Restarting bot...", ephemeral: true });
+            process.exit(0);
+            break;
+          case "resetmemory":
+            conversationTracker.clear();
+            await interaction.reply({ content: "Conversation memory reset.", ephemeral: true });
+            break;
+          case "clearmemory": {
+            const row = new ActionRowBuilder().addComponents(
+              new ButtonBuilder()
+                .setCustomId("clearmemory_all")
+                .setLabel("Clear All Guild Data")
+                .setStyle(ButtonStyle.Danger),
+              new ButtonBuilder()
+                .setCustomId("clearmemory_select")
+                .setLabel("Clear Specific Guild")
+                .setStyle(ButtonStyle.Secondary)
+            );
+            await interaction.reply({ content: "Choose how to clear memory:", components: [row], ephemeral: true });
+            break;
+          }
+          case "getstats": {
+            const selectMenu = new StringSelectMenuBuilder()
+              .setCustomId("getstats_select_menu")
+              .setPlaceholder("Search and select a server")
+              .addOptions(Array.from(client.guilds.cache.values()).map(guild => ({
+                label: guild.name.length > 25 ? guild.name.substring(0,22) + "..." : guild.name,
+                value: guild.id
+              })));
+            const row = new ActionRowBuilder().addComponents(selectMenu);
+            await interaction.reply({ content: "Select a server to view its stats:", components: [row], ephemeral: true });
+            break;
+          }
+          case "listusers": {
+            try {
+              const db = getDB();
+              const users = await dbFind(db, "user_data", {});
+              if (!users || users.length === 0) {
+                await interaction.reply({ content: "No users found.", ephemeral: true });
+                break;
+              }
+              const pageSize = 10;
+              const totalPages = Math.ceil(users.length / pageSize);
+              const page = 1;
+              const start = (page - 1) * pageSize;
+              const pageUsers = users.slice(start, start + pageSize);
+              const userList = pageUsers.map((r, index) => `${start + index + 1}. ${r.username} (${r.user_id})`).join("\n");
+              const content = `**Users (Page ${page} of ${totalPages}):**\n` + userList;
+              const buttons = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                  .setCustomId(`listusers_prev_${page}`)
+                  .setLabel("Previous")
+                  .setStyle(ButtonStyle.Primary)
+                  .setDisabled(true),
+                new ButtonBuilder()
+                  .setCustomId(`listusers_next_${page}`)
+                  .setLabel("Next")
+                  .setStyle(ButtonStyle.Primary)
+                  .setDisabled(totalPages <= 1)
+              );
+              await interaction.reply({ content, components: [buttons], ephemeral: true });
+            } catch (error) {
+              advancedErrorHandler(error, "List Users");
+              await interaction.reply({ content: "An error occurred while retrieving users.", ephemeral: true });
+            }
+            break;
+          }
+          case "globalchat_on":
+            globalChatEnabled = true;
+            await interaction.reply({ content: "Global chat is now ON for all servers.", ephemeral: true });
+            break;
+          case "globalchat_off":
+            globalChatEnabled = false;
+            await interaction.reply({ content: "Global chat is now OFF. Only debug commands can be used.", ephemeral: true });
+            break;
+          case "globalprefadd": {
+            if (!value) {
+              await interaction.reply({ content: "Please provide a preference value to add.", ephemeral: true });
+              return;
+            }
+            const db = getDB();
+            await dbInsert(db, "global_preferences", { preference: value });
+            await interaction.reply({ content: `Global preference added: "${value}"`, ephemeral: true });
+            break;
+          }
+          case "globalprefremove": {
+            if (value) {
+              const db = getDB();
+              await db.collection("global_preferences").deleteOne({ preference: value });
+              await interaction.reply({ content: `Global preference removed: "${value}" (if it existed)`, ephemeral: true });
+            } else {
+              const db = getDB();
+              const rows = await dbFind(db, "global_preferences", {});
+              if (rows.length === 0) {
+                await interaction.reply({ content: "No global preferences to remove.", ephemeral: true });
+                return;
+              }
+              const options = rows.map(row => ({
+                label: row.preference.length > 25 ? row.preference.substring(0,22) + "..." : row.preference,
+                value: row._id.toString()
+              }));
+              const selectMenu = new StringSelectMenuBuilder()
+                .setCustomId("globalprefremove_select")
+                .setPlaceholder("Select a global preference to remove")
+                .addOptions(options);
+              const rowComp = new ActionRowBuilder().addComponents(selectMenu);
+              await interaction.reply({ content: "Select a global preference to remove:", components: [rowComp], ephemeral: true });
+            }
+            break;
+          }
+          case "log": {
+            try {
+              const logContent = fs.readFileSync("error.log", "utf8");
+              const lines = logContent.trim().split("\n");
+              if (lines.length === 0) {
+                await interaction.reply({ content: "No logs available.", ephemeral: true });
+                break;
+              }
+              const pageSize = 25;
+              const totalPages = Math.ceil(lines.length / pageSize);
+              const page = 1;
+              const start = (page - 1) * pageSize;
+              const pageLines = lines.slice(start, start + pageSize).map((line, index) => `${start + index + 1}. ${line}`);
+              const logMessage = `**Error Logs (Page ${page} of ${totalPages}):**\n` + pageLines.join("\n");
+              const buttons = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                  .setCustomId(`log_page_prev_${page}`)
+                  .setLabel("Previous")
+                  .setStyle(ButtonStyle.Primary)
+                  .setDisabled(true),
+                new ButtonBuilder()
+                  .setCustomId(`log_page_next_${page}`)
+                  .setLabel("Next")
+                  .setStyle(ButtonStyle.Primary)
+                  .setDisabled(totalPages <= 1)
+              );
+              await interaction.reply({ content: logMessage, components: [buttons], ephemeral: true });
+            } catch (err) {
+              advancedErrorHandler(err, "Debug Log Command");
+              await interaction.reply({ content: "An error occurred while retrieving logs.", ephemeral: true });
+            }
+            break;
+          }
+          case "globalannounce": {
+            if (!value) {
+              await interaction.reply({ content: "Please provide an announcement message.", ephemeral: true });
+              return;
+            }
+            client.guilds.cache.forEach(async (guild) => {
+              let targetChannel = lastActiveChannel.get(guild.id) || guild.systemChannel;
+              if (targetChannel) {
+                try {
+                  await targetChannel.send(value);
+                } catch (err) {
+                  advancedErrorHandler(err, "Global Announcement");
+                }
+              }
+            });
+            await interaction.reply({ content: "Global announcement sent.", ephemeral: true });
+            break;
+          }
+          case "status": {
+            const statusMsg = `Bot is online.
+Global chat: ${globalChatEnabled ? "ON" : "OFF"}.
+Global custom mood: ${globalCustomMood.enabled ? globalCustomMood.mood : "disabled"}.`;
+            await interaction.reply({ content: statusMsg, ephemeral: true });
+            break;
+          }
+          case "globalmood": {
+            if (!value) {
+              await interaction.reply({ content: "Please provide 'enable <mood>' or 'disable'.", ephemeral: true });
+              return;
+            }
+            if (value.toLowerCase().startsWith("enable")) {
+              const parts = value.split(" ");
+              if (parts.length < 2) {
+                await interaction.reply({ content: "Please specify a mood to enable.", ephemeral: true });
+                return;
+              }
+              const mood = parts.slice(1).join(" ").toLowerCase();
+              if (!Object.keys(moodPresetReplies).includes(mood)) {
+                await interaction.reply({ content: `Invalid mood. Available moods: ${Object.keys(moodPresetReplies).join(", ")}`, ephemeral: true });
+                return;
+              }
+              globalCustomMood.enabled = true;
+              globalCustomMood.mood = mood;
+              await interaction.reply({ content: `Global custom mood enabled: ${mood}`, ephemeral: true });
+            } else if (value.toLowerCase() === "disable") {
+              globalCustomMood.enabled = false;
+              globalCustomMood.mood = null;
+              await interaction.reply({ content: "Global custom mood disabled. Using user-based moods.", ephemeral: true });
+            } else {
+              await interaction.reply({ content: "Invalid value. Use 'enable <mood>' or 'disable'.", ephemeral: true });
+            }
+            break;
+          }
+          case "database": {
+            try {
+              const row = new ActionRowBuilder().addComponents(
+                new StringSelectMenuBuilder()
+                  .setCustomId("database_server_select")
+                  .setPlaceholder("Select a server")
+                  .addOptions(Array.from(client.guilds.cache.values()).map(guild => ({
+                    label: guild.name.length > 25 ? guild.name.substring(0,22) + "..." : guild.name,
+                    value: guild.id
+                  })))
+              );
+              await interaction.reply({ content: "Select a server to view its database folders:", components: [row], ephemeral: true });
+            } catch (error) {
+              advancedErrorHandler(error, "Database Command");
+              await interaction.reply({ content: "An error occurred while processing the database command.", ephemeral: true });
+            }
+            break;
+          }
+          case "userdb": {
+            // New debug action: Show the DM user's database contents.
+            const db = getDB(); // DM database
+            const userData = await dbFind(db, "user_data", { user_id: interaction.user.id });
+            const moodData = await dbFind(db, "mood_data", { user_id: interaction.user.id });
+            const remembered = await dbFind(db, "user_remember", { user_id: interaction.user.id });
+            const content = `**User Database for ${interaction.user.username}:**
+User Data: ${JSON.stringify(userData)}
+Mood Data: ${JSON.stringify(moodData)}
+Remembered Info: ${JSON.stringify(remembered)}`;
+            await interaction.reply({ content, ephemeral: true });
+            break;
+          }
+          default:
+            await interaction.reply({ content: "Unknown debug command.", ephemeral: true });
+            break;
+        }
+      } else if (commandName === "set") {
+        if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator) && !interaction.member.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
+          await interaction.reply({ content: "Insufficient permissions. Requires Administrator or Manage Server.", ephemeral: true });
+          return;
+        }
+        const subcommand = interaction.options.getSubcommand();
+        if (subcommand === "channel") {
+          const channels = interaction.guild.channels.cache.filter(c => c.type === ChannelType.GuildText);
+          const options = channels.map(ch => ({ label: ch.name, value: ch.id }));
+          if (options.length === 0) {
+            await interaction.reply({ content: "No text channels available.", ephemeral: true });
+            return;
+          }
+          const selectMenu = new StringSelectMenuBuilder()
+            .setCustomId("setchannel_select")
+            .setPlaceholder("Select a channel for the bot to talk in")
+            .addOptions(options);
+          const row = new ActionRowBuilder().addComponents(selectMenu);
+          await interaction.reply({ content: "Select a channel to allow the bot to talk in:", components: [row], ephemeral: true });
+        } else if (subcommand === "remove") {
+          const settings = await getGuildSettings(interaction.guild.id);
+          const allowed = settings.allowed_channels;
+          if (allowed.length === 0) {
+            await interaction.reply({ content: "No channels have been set for the bot.", ephemeral: true });
+            return;
+          }
+          const options = allowed.map(channelId => {
+            const channel = interaction.guild.channels.cache.get(channelId);
+            return {
+              label: channel ? channel.name : channelId,
+              value: channelId
+            };
+          });
+          const selectMenu = new StringSelectMenuBuilder()
+            .setCustomId("removechannel_select")
+            .setPlaceholder("Select a channel to remove from allowed channels")
+            .addOptions(options);
+          const row = new ActionRowBuilder().addComponents(selectMenu);
+          await interaction.reply({ content: "Select a channel to remove:", components: [row], ephemeral: true });
+        }
+      } else if (commandName === "remember") {
         const fields = ["name", "birthday", "gender", "dislikes", "likes", "about"];
-        const options = fields.map(field => ({ label: field, value: field }));
+        let updates = {};
+        fields.forEach(field => {
+          const valueField = interaction.options.getString(field);
+          if (valueField) updates[field] = valueField;
+        });
+        if (Object.keys(updates).length === 0) {
+          await interaction.reply({ content: "Please provide at least one field to remember.", ephemeral: true });
+          return;
+        }
+        const db = getDB();
+        const existingRows = await dbFind(db, "user_remember", { user_id: interaction.user.id });
+        if (existingRows.length === 0) {
+          await dbInsert(db, "user_remember", {
+            user_id: interaction.user.id,
+            name: updates.name || null,
+            birthday: updates.birthday || null,
+            gender: updates.gender || null,
+            dislikes: updates.dislikes ? [updates.dislikes] : [],
+            likes: updates.likes ? [updates.likes] : [],
+            about: updates.about ? [updates.about] : []
+          });
+        } else {
+          const row = existingRows[0];
+          for (const field in updates) {
+            if (["likes", "dislikes", "about"].includes(field)) {
+              let arr = [];
+              if (row[field]) {
+                arr = row[field];
+                if (!Array.isArray(arr)) arr = [row[field]];
+              }
+              arr.push(updates[field]);
+              await dbUpdate(db, "user_remember", { user_id: interaction.user.id }, { $set: { [field]: arr } });
+            } else {
+              await dbUpdate(db, "user_remember", { user_id: interaction.user.id }, { $set: { [field]: updates[field] } });
+            }
+          }
+        }
+        await interaction.reply({ content: "Your personal info has been remembered.", ephemeral: true });
+      } else if (commandName === "unremember") {
+        const db = getDB();
+        const rowData = await dbFind(db, "user_remember", { user_id: interaction.user.id });
+        if (rowData.length === 0) {
+          await interaction.reply({ content: "You have no remembered info.", ephemeral: true });
+          return;
+        }
+        const data = rowData[0];
+        let options = [];
+        for (const field of ["name", "birthday", "gender", "dislikes", "likes", "about"]) {
+          if (data[field]) {
+            if (Array.isArray(data[field]) && data[field].length > 1) {
+              data[field].forEach((item, idx) => {
+                options.push({ label: `${field}[${idx}]: ${item}`, value: `${field}_${idx}` });
+              });
+            } else {
+              options.push({ label: `${field}: ${data[field]}`, value: field });
+            }
+          }
+        }
+        if (options.length === 0) {
+          await interaction.reply({ content: "Nothing to unremember.", ephemeral: true });
+          return;
+        }
         const selectMenu = new StringSelectMenuBuilder()
           .setCustomId("unremember_select")
-          .setPlaceholder("Select the field to remove")
+          .setPlaceholder("Select a field/item to remove")
           .addOptions(options);
         const row = new ActionRowBuilder().addComponents(selectMenu);
-        await interaction.reply({ content: "Select which information to remove:", components: [row], ephemeral: true });
-      } else if (commandName === "gif") {
-        const keyword = interaction.options.getString("keyword") || "funny";
-        const gifObj = await getRandomGif(keyword);
-        await interaction.reply({ content: gifObj.url });
+        await interaction.reply({ content: "Select a field/item to remove from your remembered info:", components: [row], ephemeral: true });
       } else if (commandName === "meme") {
         const keyword = interaction.options.getString("keyword") || "funny";
         const memeObj = await getRandomMeme(keyword);
         await interaction.reply({ content: memeObj.url });
         await storeMedia("meme", memeObj.url, memeObj.name);
+      } else if (commandName === "gif") {
+        const keyword = interaction.options.getString("keyword") || "funny";
+        const gifObj = await getRandomGif(keyword);
+        await interaction.reply({ content: gifObj.url });
+        await storeMedia("gif", gifObj.url, gifObj.name);
       }
-    }
-    // Handle interactive component responses (select menus, buttons)
-    else if (interaction.isSelectMenu()) {
+    } else if (interaction.isStringSelectMenu()) {
       if (interaction.customId === "prefremove_select") {
-        const index = parseInt(interaction.values[0], 10);
-        const result = await removePreference(interaction.user.id, index);
-        await interaction.update({ content: result.message, components: [] });
+        const selectedIndex = parseInt(interaction.values[0], 10);
+        const prefs = await listPreferences(interaction.user.id);
+        if (!prefs || selectedIndex < 0 || selectedIndex >= prefs.length) {
+          await interaction.update({ content: "Invalid selection.", components: [] });
+          return;
+        }
+        const removed = await removePreference(interaction.user.id, selectedIndex);
+        await interaction.update({ content: removed.message, components: [] });
+      } else if (interaction.customId === "globalprefremove_select") {
+        const selectedId = interaction.values[0];
+        const db = getDB();
+        await db.collection("global_preferences").deleteOne({ _id: selectedId });
+        await interaction.update({ content: "Global preference removed.", components: [] });
+      } else if (interaction.customId === "setchannel_select") {
+        const selectedChannelId = interaction.values[0];
+        const settings = await getGuildSettings(interaction.guild.id);
+        let allowed = settings.allowed_channels;
+        if (!allowed.includes(selectedChannelId)) {
+          allowed.push(selectedChannelId);
+          await updateGuildAllowedChannels(interaction.guild.id, allowed);
+          await interaction.update({ content: `Channel <#${selectedChannelId}> added to allowed channels.`, components: [] });
+        } else {
+          await interaction.update({ content: "Channel is already in the allowed list.", components: [] });
+        }
+      } else if (interaction.customId === "removechannel_select") {
+        const selectedChannelId = interaction.values[0];
+        const settings = await getGuildSettings(interaction.guild.id);
+        let allowed = settings.allowed_channels;
+        if (allowed.includes(selectedChannelId)) {
+          allowed = allowed.filter(id => id !== selectedChannelId);
+          await updateGuildAllowedChannels(interaction.guild.id, allowed);
+          await interaction.update({ content: `Channel <#${selectedChannelId}> removed from allowed channels.`, components: [] });
+        } else {
+          await interaction.update({ content: "Channel not found in the allowed list.", components: [] });
+        }
       } else if (interaction.customId === "unremember_select") {
-        const field = interaction.values[0];
-        // Remove only the selected field from remembered info
-        await dbUpdate("user_remember", { user_id: interaction.user.id }, { $unset: { [field]: "" } });
-        await interaction.update({ content: `Removed your ${field}.`, components: [] });
-      }
-    }
-    else if (interaction.isButton()) {
-      // Example: Log pagination buttons
-      if (interaction.customId.startsWith("log_page_prev_") || interaction.customId.startsWith("log_page_next_")) {
+        const value = interaction.values[0];
+        const db = getDB();
+        if (value.includes("_")) {
+          const [field, indexStr] = value.split("_");
+          const index = parseInt(indexStr, 10);
+          const rowData = await dbFind(db, "user_remember", { user_id: interaction.user.id });
+          if (rowData.length === 0) {
+            await interaction.update({ content: "No remembered info found.", components: [] });
+            return;
+          }
+          let fieldData;
+          try {
+            fieldData = rowData[0][field];
+            if (!Array.isArray(fieldData)) fieldData = [fieldData];
+          } catch (e) {
+            fieldData = [];
+          }
+          if (!Array.isArray(fieldData) || index < 0 || index >= fieldData.length) {
+            await interaction.update({ content: "Invalid selection.", components: [] });
+            return;
+          }
+          fieldData.splice(index, 1);
+          await dbUpdate(db, "user_remember", { user_id: interaction.user.id }, { $set: { [field]: fieldData } });
+          await interaction.update({ content: `Removed item ${index} from ${field}.`, components: [] });
+        } else {
+          await dbUpdate(db, "user_remember", { user_id: interaction.user.id }, { $unset: { [interaction.values[0]]: "" } });
+          await interaction.update({ content: `Removed your ${interaction.values[0]} from remembered info.`, components: [] });
+        }
+      } else if (interaction.customId === "database_server_select") {
+        try {
+          const serverId = interaction.values[0];
+          const selectMenu = new StringSelectMenuBuilder()
+            .setCustomId(`database_folder_select_${serverId}`)
+            .setPlaceholder("Select a database folder")
+            .addOptions([
+              { label: "Chat Messages", value: "chat_messages" },
+              { label: "User Data", value: "user_data" },
+              { label: "Mood Data", value: "mood_data" },
+              { label: "Server Settings", value: "server_settings" },
+              { label: "Global Preferences", value: "global_preferences" },
+              { label: "User Remember", value: "user_remember" },
+              { label: "Media Library", value: "media_library" }
+            ]);
+          const row = new ActionRowBuilder().addComponents(selectMenu);
+          await interaction.update({ content: "Select a database folder to view its data:", components: [row] });
+        } catch (error) {
+          advancedErrorHandler(error, "Database Server Selection");
+          await interaction.reply({ content: "An error occurred during server selection.", ephemeral: true });
+        }
+      } else if (interaction.customId.startsWith("database_folder_select_")) {
+        try {
+          const serverId = interaction.customId.split("_").pop();
+          const folder = interaction.values[0];
+          const db = getDB(serverId);
+          let rows = await dbFind(db, folder, {});
+          if (!rows || rows.length === 0) {
+            await interaction.update({ content: "No data found in the selected folder.", components: [] });
+            return;
+          }
+          const pageSize = 25;
+          const totalPages = Math.ceil(rows.length / pageSize);
+          const page = 1;
+          const start = (page - 1) * pageSize;
+          const pageRows = rows.slice(start, start + pageSize);
+          let content = `**Data from ${folder} (Page ${page} of ${totalPages}):**\n`;
+          pageRows.forEach((row, index) => {
+            content += `${start + index + 1}. ${JSON.stringify(row)}\n`;
+          });
+          const buttons = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`database_prev_${folder}_${serverId}_${page}`)
+              .setLabel("Previous")
+              .setStyle(ButtonStyle.Primary)
+              .setDisabled(true),
+            new ButtonBuilder()
+              .setCustomId(`database_next_${folder}_${serverId}_${page}`)
+              .setLabel("Next")
+              .setStyle(ButtonStyle.Primary)
+              .setDisabled(page === totalPages)
+          );
+          await interaction.update({ content, components: [buttons] });
+        } catch (error) {
+          advancedErrorHandler(error, "Database Folder Selection");
+          await interaction.reply({ content: "An error occurred while retrieving folder data.", ephemeral: true });
+        }
+      } else if (interaction.customId === "clearmemory_select") {
+        const selectMenu = new StringSelectMenuBuilder()
+          .setCustomId("clearmemory_guild_select")
+          .setPlaceholder("Select a guild to clear memory")
+          .addOptions(Array.from(client.guilds.cache.values()).map(guild => ({
+            label: guild.name.length > 25 ? guild.name.substring(0,22) + "..." : guild.name,
+            value: guild.id
+          })));
+        const row = new ActionRowBuilder().addComponents(selectMenu);
+        await interaction.update({ content: "Select a guild to clear its database memory:", components: [row] });
+      } else if (interaction.customId === "clearmemory_all") {
+        const db = getDB();
+        await db.collection("chat_messages").deleteMany({});
+        await db.collection("server_settings").deleteMany({});
+        await interaction.update({ content: "Cleared database memory for all guilds.", components: [] });
+      } else if (interaction.customId === "clearmemory_guild_select") {
+        const guildId = interaction.values[0];
+        const db = getDB(guildId);
+        await db.collection("chat_messages").deleteMany({});
+        await db.collection("server_settings").deleteMany({});
+        await interaction.update({ content: `Cleared database memory for guild ${guildId}.`, components: [] });
+      } else if (interaction.customId.startsWith("log_page_prev_") || interaction.customId.startsWith("log_page_next_")) {
         try {
           const parts = interaction.customId.split("_");
           const direction = parts[2];
@@ -944,12 +1392,12 @@ client.on("interactionCreate", async (interaction) => { // 12.1.1
           advancedErrorHandler(error, "Log Pagination Button");
           await interaction.reply({ content: "An error occurred while updating logs.", ephemeral: true });
         }
-      }
-      else if (interaction.customId.startsWith("listusers_prev_") || interaction.customId.startsWith("listusers_next_")) {
+      } else if (interaction.customId.startsWith("listusers_prev_") || interaction.customId.startsWith("listusers_next_")) {
         try {
           const parts = interaction.customId.split("_");
           let currentPage = parseInt(parts[2], 10);
-          const users = await dbFind("user_data", {});
+          const db = getDB();
+          const users = await dbFind(db, "user_data", {});
           const pageSize = 10;
           const totalPages = Math.ceil(users.length / pageSize);
           if (interaction.customId.startsWith("listusers_next_")) {
@@ -960,7 +1408,7 @@ client.on("interactionCreate", async (interaction) => { // 12.1.1
           const start = (currentPage - 1) * pageSize;
           const pageUsers = users.slice(start, start + pageSize);
           const userList = pageUsers.map((r, index) => `${start + index + 1}. ${r.username} (${r.user_id})`).join("\n");
-          const contentMsg = `**Users (Page ${currentPage} of ${totalPages}):**\n` + userList;
+          const content = `**Users (Page ${currentPage} of ${totalPages}):**\n` + userList;
           const buttons = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
               .setCustomId(`listusers_prev_${currentPage}`)
@@ -973,47 +1421,86 @@ client.on("interactionCreate", async (interaction) => { // 12.1.1
               .setStyle(ButtonStyle.Primary)
               .setDisabled(currentPage === totalPages)
           );
-          await interaction.update({ content: contentMsg, components: [buttons] });
+          await interaction.update({ content, components: [buttons] });
         } catch (error) {
           advancedErrorHandler(error, "List Users Pagination");
-          await interaction.reply({ content: "An error occurred while updating user list.", ephemeral: true });
+          await interaction.reply({ content: "An error occurred while updating users list.", ephemeral: true });
+        }
+      } else if (interaction.customId === "getstats_select_menu") {
+        try {
+          const serverId = interaction.values[0];
+          const guild = client.guilds.cache.get(serverId);
+          if (!guild) {
+            await interaction.update({ content: "Server not found.", components: [] });
+            return;
+          }
+          const profilePic = guild.iconURL({ dynamic: true }) || "No profile picture.";
+          const totalMembers = guild.memberCount || "N/A";
+          let activeUsers = 0;
+          conversationTracker.forEach((data, channelId) => {
+            const channel = client.channels.cache.get(channelId);
+            if (channel && channel.guild && channel.guild.id === guild.id) {
+              activeUsers += data.participants.size;
+            }
+          });
+          const textChannels = guild.channels.cache.filter(ch => ch.type === ChannelType.GuildText);
+          const channelIds = Array.from(textChannels.keys());
+          let totalInteracted = "N/A";
+          if (channelIds.length > 0) {
+            // For MongoDB, count distinct users in chat_messages
+            const db = getDB(guild.id);
+            const usersCount = await db.collection("chat_messages").distinct("user");
+            totalInteracted = usersCount.length;
+          }
+          const statsMessage = `**Server Stats for ${guild.name}:**
+Profile Picture: ${profilePic}
+Total Members: ${totalMembers}
+Active Users Talking Now: ${activeUsers}
+Total Unique Users (All Time): ${totalInteracted}`;
+          await interaction.update({ content: statsMessage, components: [] });
+        } catch (error) {
+          advancedErrorHandler(error, "GetStats Server Details");
+          await interaction.reply({ content: "An error occurred while retrieving server stats.", ephemeral: true });
         }
       }
+    } else if (interaction.isButton()) {
+      const customId = interaction.customId;
+      // Button handlers (log pagination, listusers, etc.) are already handled above.
     }
   } catch (error) {
     advancedErrorHandler(error, "Interaction Handler");
-    if (!interaction.replied) {
-      await interaction.reply({ content: "An error occurred while processing your interaction.", ephemeral: true });
+    try {
+      if (!interaction.replied) {
+        await interaction.reply({ content: "An error occurred while processing your request. Please try again later.", ephemeral: true });
+      }
+    } catch (err) {
+      advancedErrorHandler(err, "Interaction Error Reply");
     }
   }
 });
 
 /********************************************************************
- * MAJOR SECTION 13: MESSAGE HANDLER
- * 13.1: Handle incoming messages and trigger responses, including attachments OCR,
- * auto-reply logic, meme/gif trigger and chatWithGemini reply.
+ * DISCORD BOT - Major Section 12: MESSAGE HANDLER (INCLUDING OCR)
  ********************************************************************/
-client.on("messageCreate", async (message) => { // 13.1
+client.on("messageCreate", async (message) => {
   try {
-    // 13.2: Update last active channel.
     if (message.guild && message.channel.type === ChannelType.GuildText) {
       lastActiveChannel.set(message.guild.id, message.channel);
     }
-    // 13.3: Process attachments for OCR if images are sent.
     if (message.attachments.size > 0) {
       for (const attachment of message.attachments.values()) {
         if (attachment.contentType && attachment.contentType.startsWith("image/")) {
           const ocrResult = await performOCR(attachment.url);
           if (ocrResult) {
-            // Append OCR text to message content for context.
             message.content += `\n[OCR]: ${ocrResult}`;
           }
         }
       }
     }
     if (!globalChatEnabled) return;
-    // Insert chat message into database (MongoDB)
-    await dbInsert("chat_messages", {
+    // Store chat messages in the appropriate MongoDB collection.
+    const db = message.guild ? getDB(message.guild.id) : getDB();
+    await dbInsert(db, "chat_messages", {
       discord_id: message.id,
       channel_id: message.channel.id,
       user: message.author.id,
@@ -1024,42 +1511,10 @@ client.on("messageCreate", async (message) => { // 13.1
     if (message.guild) {
       const settings = await getGuildSettings(message.guild.id);
       if (settings.chat_enabled !== 1) return;
-      if (settings.allowed_channels.length > 0 && !settings.allowed_channels.includes(message.channel.id)) return;
     }
-    // 13.4: Trigger meme/gif sending if keywords found.
-    const triggers = ["meme", "funny", "gif"];
-    if (triggers.some(t => message.content.toLowerCase().includes(t)) && Math.random() < 0.30) {
-      const searchTerm = lastBotMessageContent ? lastBotMessageContent.split(" ").slice(0, 3).join(" ") : "funny";
-      if (Math.random() < 0.5) {
-        const memeObj = await getRandomMeme(searchTerm);
-        try {
-          await message.channel.send({ content: memeObj.url });
-          await storeMedia("meme", memeObj.url, memeObj.name);
-        } catch (err) {
-          advancedErrorHandler(err, "Sending Meme");
-        }
-      } else {
-        const gifObj = await getRandomGif(searchTerm);
-        try {
-          await message.channel.send({ content: gifObj.url });
-          await storeMedia("gif", gifObj.url, gifObj.name);
-        } catch (err) {
-          advancedErrorHandler(err, "Sending Gif");
-        }
-      }
-      return;
-    }
-    if (!shouldReply(message)) return;
-    const replyContent = await chatWithGemini(message.author.id, message.content);
-    if (replyContent === lastReply) return;
-    lastReply = replyContent;
-    try {
-      const sentMsg = await message.channel.send(replyContent);
-      lastBotMessageContent = replyContent;
-      botMessageIds.add(sentMsg.id);
-      setTimeout(() => botMessageIds.delete(sentMsg.id), 3600000);
-    } catch (err) {
-      advancedErrorHandler(err, "Sending Reply");
+    if (shouldReply(message)) {
+      const replyText = await chatWithGemini(message.author.id, message.content);
+      message.reply(replyText);
     }
   } catch (error) {
     advancedErrorHandler(error, "Message Handler");
@@ -1067,14 +1522,25 @@ client.on("messageCreate", async (message) => { // 13.1
 });
 
 /********************************************************************
- * MAJOR SECTION 14: EXPRESS SERVER SETUP (FOR RENDER KEEP-ALIVE)
+ * DISCORD BOT - Major Section 13: EXPRESS SERVER FOR UPTIME MONITORING
  ********************************************************************/
 const app = express();
-app.get("/", (req, res) => {
-  res.send("Bot is running!");
-});
-app.listen(PORT, () => {
-  console.log(`Express server is listening on port ${PORT}`);
-});
+app.get("/", (req, res) => res.send("noobhay tripathi is alive! 🚀"));
+app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
 
-client.login(DISCORD_TOKEN);
+/********************************************************************
+ * DISCORD BOT - Minor Section 4: AUTO-RETRY LOGIN FUNCTIONALITY
+ ********************************************************************/
+async function startBot() {
+  while (true) {
+    try {
+      await client.login(DISCORD_TOKEN);
+      break;
+    } catch (error) {
+      advancedErrorHandler(error, "Login");
+      await new Promise(resolve => setTimeout(resolve, 10000)); // Retry every 10 seconds
+    }
+  }
+}
+
+startBot();
