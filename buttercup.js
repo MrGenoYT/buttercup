@@ -19,7 +19,7 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const TENOR_API_KEY = process.env.TENOR_API_KEY;
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 4000;
 const MONGO_URI = process.env.MONGO_URI; // MongoDB connection URI
 
 // Global chat toggle for all servers (default ON)
@@ -1523,9 +1523,9 @@ client.on("messageCreate", async (message) => {
 
 /********************************************************************
  /********************************************************************
- * DISCORD BOT - Major Section 13: EXPRESS SERVER FOR UPTIME MONITORING
+ * DISCORD BOT - Major Section 16: EXPRESS SERVER FOR UPTIME MONITORING
  ********************************************************************/
-// 15.1: Set up a simple express server to keep the bot alive.
+// 16.1: Set up a simple express server to keep the bot alive.
 const app = express();
 app.get("/", (req, res) => res.send("bot is alive! 🚀"));
 app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
