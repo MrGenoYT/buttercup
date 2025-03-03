@@ -1770,8 +1770,26 @@ setInterval(async () => {
 /********************************************************************
  * EXPRESS SERVER (if needed for keeping the bot alive on hosting platforms)
  ********************************************************************/
+// 15.1: Set up a simple express server to keep the bot alive.
 const app = express();
-app.get("/", (req, res) => res.send("Bot is running."));
-app.listen(PORT, () => console.log(`Express server listening on port ${PORT}`));
+app.get("/", (req, res) => res.send("noobhay tripathi is alive! 🚀"));
+app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
 
-client.login(DISCORD_TOKEN);
+
+/********************************************************************
+ * DISCORD BOT - Minor Section 4: AUTO-RETRY LOGIN FUNCTIONALITY
+ ********************************************************************/
+// 16.1: Continuously try logging in until successful.
+async function startBot() {
+  while (true) {
+    try {
+      await client.login(DISCORD_TOKEN);
+      break;
+    } catch (error) {
+      advancedErrorHandler(error, "Login");
+      await new Promise(resolve => setTimeout(resolve, 10000));
+    }
+  }
+}
+
+startBot();
