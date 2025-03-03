@@ -1718,7 +1718,7 @@ client.on("messageCreate", async (message) => {
 });
 
 /********************************************************************
- * DISCORD BOT - Major Section 12B: MESSAGE EDIT HANDLER
+ * DISCORD BOT - Major Section 12: MESSAGE EDIT HANDLER
  ********************************************************************/
 client.on("messageUpdate", async (oldMessage, newMessage) => {
   try {
@@ -1746,7 +1746,7 @@ client.on("messageUpdate", async (oldMessage, newMessage) => {
 });
 
 /********************************************************************
- * DISCORD BOT - Inactivity Checker: Send reminder after 3 hours of no messages
+ * DISCORD BOT - Inactivity Checker: Major Section 13: Send reminder after 3 hours of no messages
  ********************************************************************/
 setInterval(async () => {
   const now = Date.now();
@@ -1768,7 +1768,7 @@ setInterval(async () => {
 }, 300000); // check every 5 minutes
 
 /********************************************************************
- * EXPRESS SERVER (if needed for keeping the bot alive on hosting platforms)
+ * EXPRESS SERVER - Major Section 14: if needed for keeping the bot alive on hosting platforms
  ********************************************************************/
 // 15.1: Set up a simple express server to keep the bot alive.
 const app = express();
@@ -1777,7 +1777,7 @@ app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
 
 
 /********************************************************************
- * DISCORD BOT - Minor Section 4: AUTO-RETRY LOGIN FUNCTIONALITY
+ * DISCORD BOT - Majorr Section 15: AUTO-RETRY LOGIN FUNCTIONALITY
  ********************************************************************/
 // 16.1: Continuously try logging in until successful.
 async function startBot() {
