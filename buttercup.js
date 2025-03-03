@@ -16,20 +16,27 @@ import fs from "fs";
 dotenv.config();
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
+const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID; // renamed variable
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const TENOR_API_KEY = process.env.TENOR_API_KEY;
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI; // MongoDB connection URI
 
-// Global chat toggle for all servers (default ON)
+// Global toggles and settings
 let globalChatEnabled = true;
-
-// Global custom mood override (when enabled, all users use this mood)
 let globalCustomMood = { enabled: false, mood: null };
+const userContinuousReply = new Map(); // userId -> boolean
+const conversationTracker = new Map(); // channelId -> { count, participants, multiCount }
+const botReplyMap = new Map(); // original message id -> bot reply message
+const lastActiveChannel = new Map(); // guildId -> channel
+const lastActivity = new Map(); // channelId -> timestamp (ms)
+const inactivityNotified = new Map(); // channelId -> boolean
 
-// Map to track bot replies for message edits
-const botReplyMap = new Map();
+// Preset messages for inactivity (only two with @everyone/@here)
+const inactivityPresets = [
+  "@everyone, where are you all? It's been quiet here for too long!",
+  "@here, did everyone vanish? Let’s get some action!"
+];
 
 /********************************************************************
  * DISCORD BOT - Minor Section 1: ADVANCED ERROR HANDLING SETUP
@@ -51,8 +58,6 @@ process.on("uncaughtException", (error) => {
 process.on("unhandledRejection", (reason) => {
   advancedErrorHandler(reason, "Unhandled Rejection");
 });
-
-// Listen for Discord shard disconnects and attempt to reconnect
 process.on("SIGINT", async () => {
   console.log("SIGINT received. Closing MongoDB connection and exiting...");
   try {
@@ -98,7 +103,7 @@ async function dbInsert(db, collectionName, doc) {
 async function dbUpdate(db, collectionName, filter, update, options = {}) {
   try {
     await db.collection(collectionName).updateOne(filter, update, { upsert: true, ...options });
-    console.log(`dbUpdate: Document updated in ${collectionName} with filter ${JSON.stringify(filter)}.`);
+    console.log(`dbUpdate: Updated document in ${collectionName} with filter ${JSON.stringify(filter)}.`);
   } catch (error) {
     advancedErrorHandler(error, "dbUpdate");
   }
@@ -117,14 +122,17 @@ async function dbFind(db, collectionName, filter = {}, options = {}) {
 
 async function updateMessageInDB(db, messageId, newContent) {
   try {
-    await db.collection("chat_messages").updateOne({ discord_id: messageId }, { $set: { content: newContent, edited: true } });
+    await db.collection("chat_messages").updateOne(
+      { discord_id: messageId },
+      { $set: { content: newContent, edited: true } }
+    );
     console.log(`updateMessageInDB: Updated message ${messageId} in DB.`);
   } catch (error) {
     advancedErrorHandler(error, "updateMessageInDB");
   }
 }
 
-/* --- Server settings helper functions --- */
+// Server settings helper functions
 async function setGuildChat(guildId, enabled) {
   const db = getDB(guildId);
   await dbUpdate(db, "server_settings", { guild_id: guildId }, { $set: { chat_enabled: enabled ? 1 : 0, allowed_channels: [] } });
@@ -267,11 +275,11 @@ const baseBehaviour = `Base Behaviour:
 // Bot base instructions with modified identity.
 const botBaseInstructions = `
 you're arnav singh rana.
-your discord username is muted amd roblox name is buttercup.
+your discord username is muted and your roblox name is buttercup.
 you're 16 years old.
 you're a male.
-your birthday is on 28th April and you were born in the year 2009.
-you're a straight person.
+your birthday is on 28th April 2009.
+you're straight.
 you live in Lucknow, Uttar Pradesh India.
 you're a good person.
 you remember past conversations.
@@ -286,7 +294,7 @@ you can access the internet.
 you mostly try to keep responses short but strong.
 your roblox name is butter.
 you're a savage sigma male with sarcasm.
-your best friends are red/haryaksh and ankit and beast(vensly) and noobhay(ayushmaan).
+your best friends are red/haryaksh, ankit, beast(vensly) and noobhay(ayushmaan).
 you write in a casual way mostly.
 you speak mostly in lower case.
 be polite unless provoked.
@@ -301,12 +309,12 @@ respond like someone born after 2010.
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
-async function performOCR(imageUrl) {
+async function performOCR(fileUrl) {
   try {
-    const ocrPrompt = `Please extract any text from the following image URL: ${imageUrl}`;
+    const ocrPrompt = `Please extract any text from the following file URL: ${fileUrl}`;
     const result = await model.generateContent(ocrPrompt);
     let ocrText = (result.response && result.response.text()) || "";
-    console.log("performOCR: OCR completed for image:", imageUrl);
+    console.log("performOCR: OCR completed for file:", fileUrl);
     return ocrText.trim();
   } catch (error) {
     advancedErrorHandler(error, "performOCR");
@@ -331,7 +339,7 @@ const client = new Client({
 client.once("ready", async () => {
   console.log("sir, bot is online!");
 
-  // Assign role "NICO" to bot in every guild
+  // Initial role assignment for "NICO"
   client.guilds.cache.forEach(async (guild) => {
     try {
       const roleName = "NICO";
@@ -353,22 +361,44 @@ client.once("ready", async () => {
     }
   });
 
+  // Set up periodic check (every 1 hour) for new servers to assign NICO role
+  setInterval(() => {
+    client.guilds.cache.forEach(async (guild) => {
+      try {
+        const roleName = "NICO";
+        let role = guild.roles.cache.find(r => r.name === roleName);
+        if (!role) {
+          role = await guild.roles.create({
+            name: roleName,
+            color: "#FF0000",
+            reason: "Auto-created role for the bot (periodic check)"
+          });
+        }
+        const botMember = guild.members.cache.get(client.user.id);
+        if (botMember && !botMember.roles.cache.has(role.id)) {
+          await botMember.roles.add(role);
+          console.log(`Periodic: Assigned ${roleName} role in guild "${guild.name}"`);
+        }
+      } catch (error) {
+        advancedErrorHandler(error, `Periodic Role Assignment for "${guild.name}"`);
+      }
+    });
+  }, 3600000); // 1 hour
+
   // Feature check summary
   console.log("--------- FEATURE CHECK SUMMARY ---------");
-  console.log("1. Auto-Reconnect & Keep-Alive: Enabled (auto-retry login and disconnect listeners active)");
-  console.log("2. GIF Reply: Enabled (50% chance reply when message contains a gif)");
+  console.log("1. Auto-Reconnect & Keep-Alive: Enabled");
+  console.log("2. GIF Reply: Enabled (50% chance when message contains a gif)");
   console.log("3. Advanced Error Handling & Debug Logging: Enabled");
-  console.log("4. API Limits: Reddit set to 20 items, Tenor limited to 1 result");
+  console.log("4. API Limits: Reddit set to 1 item, Tenor limited to 5 results");
   console.log("5. MongoDB Handling: Active with graceful shutdown on SIGINT/SIGTERM");
   console.log("6. Message Edit Handling: Enabled (bot updates stored message and its own reply if applicable)");
-  console.log("7. Gemini Context (Remember & Preferences) & Tone-Adaptive Mood: Enabled");
+  console.log("7. Gemini Context & Tone-Adaptive Mood: Enabled");
   console.log("-------------------------------------------");
 });
 
 client.on("error", (error) => advancedErrorHandler(error, "Client Error"));
 client.on("warn", (info) => console.warn("Client Warning:", info));
-
-// Additional event for disconnects and reconnections
 client.on("shardDisconnect", (event, id) => {
   console.warn(`Shard ${id} disconnected:`, event);
 });
@@ -379,151 +409,8 @@ client.on("shardReconnecting", (id) => {
 /********************************************************************
  * DISCORD BOT - Minor Section 2: GLOBAL STATE & HELPER FUNCTIONS
  ********************************************************************/
-const conversationTracker = new Map(); // key: channelId, value: { count, participants, multiCount }
-const userContinuousReply = new Map();
-let lastBotMessageContent = "";
-let lastReply = "";
-const botMessageIds = new Set();
-const lastActiveChannel = new Map();
-
 function getRandomElement(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
-}
-
-/********************************************************************
- * DISCORD BOT - Major Section 6: MEME, GIF & WEB SEARCH FUNCTIONS
- ********************************************************************/
-async function getRandomMeme(searchKeyword = "funny") {
-  try {
-    // Set Reddit API limit to 20 to avoid being blocked
-    const url = `https://www.reddit.com/r/memes/search.json?q=${encodeURIComponent(searchKeyword)}&restrict_sr=1&sort=hot&limit=20`;
-    const response = await fetch(url, { headers: { "User-Agent": "butter-bot/1.0" } });
-    if (!response.ok) {
-      console.error(`Reddit API error: ${response.status} ${response.statusText}`);
-      throw new Error("Reddit API error");
-    }
-    const data = await response.json();
-    if (!data.data || !data.data.children || data.data.children.length === 0) {
-      throw new Error("No meme results found on Reddit.");
-    }
-    const posts = data.data.children.filter(child => child.data && child.data.url && !child.data.over_18);
-    if (!posts.length) throw new Error("No valid meme posts on Reddit.");
-    const memePost = getRandomElement(posts).data;
-    if (memePost.url.includes("googlelogo_desk_heirloom_color")) {
-      throw new Error("Meme URL appears to be invalid.");
-    }
-    console.log("getRandomMeme: Successfully fetched meme from Reddit.");
-    return { url: memePost.url, name: memePost.title || "meme" };
-  } catch (error) {
-    advancedErrorHandler(error, "getRandomMeme - Reddit");
-    const fallback = await getRandomMemeFromIFunny(searchKeyword);
-    if (fallback.url.includes("googlelogo_desk_heirloom_color")) {
-      return await getRandomMemeFromGoogle(searchKeyword);
-    }
-    return fallback;
-  }
-}
-
-async function getRandomMemeFromIFunny(searchKeyword = "funny") {
-  try {
-    const searchQuery = `site:ifunny.co ${encodeURIComponent(searchKeyword)}`;
-    const searchURL = `https://www.google.com/search?q=${searchQuery}&tbm=isch`;
-    const proxyURL = `https://api.allorigins.win/get?url=${encodeURIComponent(searchURL)}`;
-    const response = await fetch(proxyURL);
-    if (!response.ok) throw new Error("Failed to fetch iFunny search results.");
-    const data = await response.json();
-    const html = data.contents;
-    const match = html.match(/<img[^>]+src="([^"]+)"/);
-    const imageUrl = match ? match[1] : null;
-    if (!imageUrl) throw new Error("No memes found on iFunny.");
-    console.log("getRandomMemeFromIFunny: Meme fetched from iFunny.");
-    return { url: imageUrl, name: "iFunny Meme" };
-  } catch (error) {
-    advancedErrorHandler(error, "getRandomMemeFromIFunny");
-    return { url: "https://ifunny.co/", name: "Couldn't fetch a meme; visit iFunny instead." };
-  }
-}
-
-async function getRandomMemeFromGoogle(searchKeyword = "funny") {
-  try {
-    const searchURL = `https://www.google.com/search?q=${encodeURIComponent(searchKeyword)}&tbm=isch`;
-    const proxyURL = `https://api.allorigins.hexocode.repl.co/get?disableCache=true&url=${encodeURIComponent(searchURL)}`;
-    const response = await fetch(proxyURL);
-    if (!response.ok) throw new Error("Google search error");
-    const data = await response.json();
-    const html = data.contents;
-    const match = html.match(/<img[^>]+src="([^"]+)"/);
-    let imageUrl = match ? match[1] : null;
-    if (!imageUrl) throw new Error("No memes found on Google.");
-    if (imageUrl.startsWith("//")) imageUrl = "https:" + imageUrl;
-    console.log("getRandomMemeFromGoogle: Meme fetched from Google.");
-    return { url: imageUrl, name: "Google Meme" };
-  } catch (error) {
-    advancedErrorHandler(error, "getRandomMemeFromGoogle");
-    return { url: "https://www.google.com", name: "Meme fetch failed; visit Google." };
-  }
-}
-
-async function getRandomGif(searchKeyword = "funny") {
-  try {
-    const url = `https://tenor.googleapis.com/v2/search?q=${encodeURIComponent(searchKeyword)}&key=${TENOR_API_KEY}&limit=5`;
-    const response = await fetch(url);
-    if (!response.ok) {
-      console.error(`Tenor API error: ${response.status} ${response.statusText}`);
-      return { url: "couldn't fetch a gif, sorry.", name: "unknown gif" };
-    }
-    const data = await response.json();
-    if (!data.results || data.results.length === 0) {
-      return { url: "couldn't find a gif, sorry.", name: "unknown gif" };
-    }
-    const randomGif = data.results[Math.floor(Math.random() * data.results.length)];
-const gifUrl = randomGif.media_formats.gif.url;
-    console.log("getRandomGif: Successfully fetched a gif.");
-    return { url: gifUrl, name: data.results[0].title || "gif" };
-  } catch (error) {
-    advancedErrorHandler(error, "getRandomGif");
-    return { url: "couldn't fetch a gif, sorry.", name: "unknown gif" };
-  }
-}
-
-async function performWebSearch(query) {
-  try {
-    const searchURL = "https://www.google.com/search?q=" + encodeURIComponent(query);
-    const url = "https://api.allorigins.hexocode.repl.co/get?disableCache=true&url=" + encodeURIComponent(searchURL);
-    const response = await fetch(url);
-    if (!response.ok) throw new Error("Search fetch error");
-    const data = await response.json();
-    const html = data.contents;
-    const regex = /<div class="BNeawe[^>]*>(.*?)<\/div>/;
-    const match = regex.exec(html);
-    let snippet = match && match[1] ? match[1] : "No snippet available.";
-    console.log("performWebSearch: Search completed for query:", query);
-    return snippet;
-  } catch (error) {
-    console.error("Web search error:", error);
-    return "Web search error.";
-  }
-}
-
-async function storeMedia(type, url, name) {
-  try {
-    const db = getDB(); // Using DM db for global media library
-    await dbInsert(db, "media_library", { type, url, name, timestamp: new Date() });
-    console.log(`storeMedia: Stored ${type} with name "${name}".`);
-  } catch (error) {
-    advancedErrorHandler(error, "storeMedia");
-  }
-}
-
-/********************************************************************
- * DISCORD BOT - Major Section 7: TONE ANALYSIS, CONTEXT & MEMORY
- ********************************************************************/
-function analyzeTone(messageContent) {
-  const politeRegex = /\b(please|thanks|thank you)\b/i;
-  const rudeRegex = /\b(ugly|shut up|idiot|stupid|yap)\b/i;
-  if (politeRegex.test(messageContent)) return "polite";
-  if (rudeRegex.test(messageContent)) return "rude";
-  return "neutral";
 }
 
 function updateConversationTracker(message) {
@@ -565,16 +452,15 @@ function shouldReply(message) {
   }
   updateConversationTracker(message);
   const tracker = conversationTracker.get(message.channel.id);
-  const isMultiUser = tracker.participants.size > 1;
-  const skipThreshold = isMultiUser ? 2 : 1;
-  if (tracker.count < skipThreshold) {
+  // For both multi-user and single conversation, set skip chance to 20%
+  const chanceNotReply = 0.20;
+  if (tracker.count < 1) {
     console.log("shouldReply: not enough messages yet, skipping reply.");
     return false;
   }
   tracker.count = 0;
-  const chanceNotReply = isMultiUser ? 0.20 : 0.30;
   const result = Math.random() >= chanceNotReply;
-  console.log(`shouldReply: isMultiUser=${isMultiUser}, chanceNotReply=${chanceNotReply}, result=${result}`);
+  console.log(`shouldReply: chanceNotReply=${chanceNotReply}, result=${result}`);
   return result;
 }
 
@@ -597,8 +483,161 @@ async function fetchOlderMemory(userMessage) {
 }
 
 /********************************************************************
- * DISCORD BOT - Major Section 8: CHAT WITH GEMINI (INCLUDING OCR & WEB)
+ * DISCORD BOT - Major Section 6: MEME, GIF & WEB SEARCH FUNCTIONS
  ********************************************************************/
+async function getRandomMeme(searchKeyword = "funny") {
+  try {
+    // Set Reddit API limit to 1 as requested
+    const url = `https://www.reddit.com/r/memes/search.json?q=${encodeURIComponent(searchKeyword)}&restrict_sr=1&sort=hot&limit=1`;
+    const response = await fetch(url, { headers: { "User-Agent": "butter-bot/1.0" } });
+    if (!response.ok) {
+      console.error(`Reddit API error: ${response.status} ${response.statusText}`);
+      throw new Error("Reddit API error");
+    }
+    const data = await response.json();
+    if (!data.data || !data.data.children || data.data.children.length === 0) {
+      throw new Error("No meme results found on Reddit.");
+    }
+    const posts = data.data.children.filter(child => child.data && child.data.url && !child.data.over_18);
+    if (!posts.length) throw new Error("No valid meme posts on Reddit.");
+    const memePost = posts[0].data;
+    if (memePost.url.includes("googlelogo_desk_heirloom_color")) {
+      throw new Error("Meme URL appears to be invalid.");
+    }
+    console.log("getRandomMeme: Successfully fetched meme from Reddit.");
+    // Tag the source so that fallback can be detected
+    return { url: memePost.url, name: memePost.title || "Reddit Meme", source: "reddit" };
+  } catch (error) {
+    advancedErrorHandler(error, "getRandomMeme - Reddit");
+    const fallback = await getRandomMemeFromIFunny(searchKeyword);
+    if (fallback.url.includes("googlelogo_desk_heirloom_color")) {
+      return await getRandomMemeFromGoogle(searchKeyword);
+    }
+    return fallback;
+  }
+}
+
+async function getRandomMemeFromIFunny(searchKeyword = "funny") {
+  try {
+    const searchQuery = `site:ifunny.co ${encodeURIComponent(searchKeyword)}`;
+    const searchURL = `https://www.google.com/search?q=${searchQuery}&tbm=isch`;
+    const proxyURL = `https://api.allorigins.win/get?url=${encodeURIComponent(searchURL)}`;
+    const response = await fetch(proxyURL);
+    if (!response.ok) throw new Error("Failed to fetch iFunny search results.");
+    const data = await response.json();
+    const html = data.contents;
+    const match = html.match(/<img[^>]+src="([^"]+)"/);
+    const imageUrl = match ? match[1] : null;
+    if (!imageUrl) throw new Error("No memes found on iFunny.");
+    console.log("getRandomMemeFromIFunny: Meme fetched from iFunny.");
+    return { url: imageUrl, name: "iFunny Meme", source: "ifunny" };
+  } catch (error) {
+    advancedErrorHandler(error, "getRandomMemeFromIFunny");
+    return { url: "https://ifunny.co/", name: "Couldn't fetch a meme; visit iFunny instead.", source: "ifunny" };
+  }
+}
+
+async function getRandomMemeFromGoogle(searchKeyword = "funny") {
+  try {
+    const searchURL = `https://www.google.com/search?q=${encodeURIComponent(searchKeyword)}&tbm=isch`;
+    const proxyURL = `https://api.allorigins.hexocode.repl.co/get?disableCache=true&url=${encodeURIComponent(searchURL)}`;
+    const response = await fetch(proxyURL);
+    if (!response.ok) throw new Error("Google search error");
+    const data = await response.json();
+    const html = data.contents;
+    const match = html.match(/<img[^>]+src="([^"]+)"/);
+    let imageUrl = match ? match[1] : null;
+    if (!imageUrl) throw new Error("No memes found on Google.");
+    if (imageUrl.startsWith("//")) imageUrl = "https:" + imageUrl;
+    console.log("getRandomMemeFromGoogle: Meme fetched from Google.");
+    return { url: imageUrl, name: "Google Meme", source: "google" };
+  } catch (error) {
+    advancedErrorHandler(error, "getRandomMemeFromGoogle");
+    return { url: "https://www.google.com", name: "Meme fetch failed; visit Google.", source: "google" };
+  }
+}
+
+async function getRandomGif(searchKeyword = "funny") {
+  try {
+    const url = `https://tenor.googleapis.com/v2/search?q=${encodeURIComponent(searchKeyword)}&key=${TENOR_API_KEY}&limit=5`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      console.error(`Tenor API error: ${response.status} ${response.statusText}`);
+      return { url: "couldn't fetch a gif, sorry.", name: "unknown gif" };
+    }
+    const data = await response.json();
+    if (!data.results || data.results.length === 0) {
+      return { url: "couldn't find a gif, sorry.", name: "unknown gif" };
+    }
+    const randomGif = data.results[Math.floor(Math.random() * data.results.length)];
+    const gifUrl = randomGif.media_formats.gif.url;
+    console.log("getRandomGif: Successfully fetched a gif.");
+    return { url: gifUrl, name: data.results[0].title || "gif" };
+  } catch (error) {
+    advancedErrorHandler(error, "getRandomGif");
+    return { url: "couldn't fetch a gif, sorry.", name: "unknown gif" };
+  }
+}
+
+// Original Google search function renamed to performGoogleWebSearch
+async function performGoogleWebSearch(query) {
+  try {
+    const searchURL = "https://www.google.com/search?q=" + encodeURIComponent(query);
+    const url = "https://api.allorigins.hexocode.repl.co/get?disableCache=true&url=" + encodeURIComponent(searchURL);
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("Search fetch error");
+    const data = await response.json();
+    const html = data.contents;
+    const regex = /<div class="BNeawe[^>]*>(.*?)<\/div>/;
+    const match = regex.exec(html);
+    let snippet = match && match[1] ? match[1] : "No snippet available.";
+    console.log("performGoogleWebSearch: Search completed for query:", query);
+    return snippet;
+  } catch (error) {
+    console.error("Web search error:", error);
+    return "Web search error.";
+  }
+}
+
+// Combined web search using Gemini and Google if query contains specific keywords
+async function performCombinedWebSearch(query) {
+  try {
+    const keywordsRegex = /\b(tell|who|search)\b/i;
+    if (keywordsRegex.test(query)) {
+      const geminiResult = await model.generateContent("Web search for: " + query);
+      const geminiSnippet = geminiResult.response ? geminiResult.response.text() : "";
+      const googleSnippet = await performGoogleWebSearch(query);
+      return `Gemini: ${geminiSnippet} | Google: ${googleSnippet}`;
+    } else {
+      return await performGoogleWebSearch(query);
+    }
+  } catch (error) {
+    advancedErrorHandler(error, "performCombinedWebSearch");
+    return "Web search failed.";
+  }
+}
+
+async function storeMedia(type, url, name) {
+  try {
+    const db = getDB(); // Using DM db for global media library
+    await dbInsert(db, "media_library", { type, url, name, timestamp: new Date() });
+    console.log(`storeMedia: Stored ${type} with name "${name}".`);
+  } catch (error) {
+    advancedErrorHandler(error, "storeMedia");
+  }
+}
+
+/********************************************************************
+ * DISCORD BOT - Major Section 7: TONE ANALYSIS, CONTEXT & MEMORY
+ ********************************************************************/
+function analyzeTone(messageContent) {
+  const politeRegex = /\b(please|thanks|thank you)\b/i;
+  const rudeRegex = /\b(ugly|shut up|idiot|stupid|yap)\b/i;
+  if (politeRegex.test(messageContent)) return "polite";
+  if (rudeRegex.test(messageContent)) return "roasting";
+  return "neutral";
+}
+
 async function chatWithGemini(userId, userMessage) {
   try {
     const db = getDB();
@@ -621,14 +660,14 @@ async function chatWithGemini(userId, userMessage) {
     }
     // Analyze tone and override mood if rude
     const tone = analyzeTone(userMessage);
-    if (tone === "rude") {
+    if (tone === "roasting") {
       userMood = "roasting";
     }
     const moodExtra = moodInstructions[userMood] || "";
     let webSearchSection = "";
     if (userMessage.toLowerCase().startsWith("search:")) {
       const searchQuery = userMessage.substring(7).trim();
-      const snippet = await performWebSearch(searchQuery);
+      const snippet = await performCombinedWebSearch(searchQuery);
       webSearchSection = `\nWeb search results for "${searchQuery}": ${snippet}\n`;
       userMessage = searchQuery;
     }
@@ -771,6 +810,7 @@ const commands = [
           { name: "clearmemory", value: "clearmemory" },
           { name: "getstats", value: "getstats" },
           { name: "listusers", value: "listusers" },
+          { name: "userdb", value: "userdb" },
           { name: "globalchat_on", value: "globalchat_on" },
           { name: "globalchat_off", value: "globalchat_off" },
           { name: "globalprefadd", value: "globalprefadd" },
@@ -780,7 +820,8 @@ const commands = [
           { name: "status", value: "status" },
           { name: "globalmood", value: "globalmood" },
           { name: "database", value: "database" },
-          { name: "userdb", value: "userdb" }
+          { name: "globalclear", value: "globalclear" },
+          { name: "getlink", value: "getlink" }
         ]
       },
       { name: "value", type: 3, description: "Optional value for the action", required: false },
@@ -791,17 +832,17 @@ const commands = [
   },
   {
     name: "set",
-    description: "Server configuration commands (requires Manage Server/Administrator)",
+    description: "Server configuration commands (requires administrator )",
     options: [
       {
         type: 1,
         name: "channel",
-        description: "Set an allowed channel for the bot to talk in"
+        description: "Set an allowed channel for the butter to talk in"
       },
       {
         type: 1,
         name: "remove",
-        description: "Remove a channel from the bot's allowed channels"
+        description: "Remove a channel from the butter's allowed channels"
       }
     ]
   },
@@ -841,7 +882,7 @@ const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 (async () => {
   try {
     console.log("Started refreshing application (/) commands.");
-    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    await rest.put(Routes.applicationCommands(DISCORD_CLIENT_ID), { body: commands });
     console.log("Successfully reloaded application (/) commands.");
   } catch (error) {
     advancedErrorHandler(error, "Slash Command Registration");
@@ -853,8 +894,9 @@ const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
  ********************************************************************/
 client.on("interactionCreate", async (interaction) => {
   try {
+    // When global chat is off, only allow debug commands.
     if (!globalChatEnabled && interaction.commandName !== "debug") {
-      await interaction.reply({ content: "Global chat is disabled. Only /debug commands are allowed.", ephemeral: true });
+      await interaction.reply({ content: "Chat is currently off by the developer.", ephemeral: true });
       return;
     }
     if (interaction.guild && interaction.commandName !== "start" && interaction.commandName !== "debug") {
@@ -927,6 +969,7 @@ client.on("interactionCreate", async (interaction) => {
           ephemeral: true
         });
       } else if (commandName === "debug") {
+        // Only authorized user can use debug commands
         if (interaction.user.id !== "840119570378784769") {
           await interaction.reply({ content: "you can't do it lil bro 💀", ephemeral: true });
           return;
@@ -934,10 +977,10 @@ client.on("interactionCreate", async (interaction) => {
         const action = interaction.options.getString("action");
         const value = interaction.options.getString("value");
         switch (action) {
-          case "ping":
-            const sent = await interaction.reply({ content: "Pong!", fetchReply: true });
-            await interaction.followUp({ content: `Latency: ${sent.createdTimestamp - interaction.createdTimestamp}ms`, ephemeral: true });
+          case "ping": {
+            const sent = await interaction.reply({ content: `Latency: ${Date.now() - interaction.createdTimestamp}ms`, fetchReply: true, ephemeral: true });
             break;
+          }
           case "restart":
             await interaction.reply({ content: "Restarting bot...", ephemeral: true });
             process.exit(0);
@@ -985,8 +1028,12 @@ client.on("interactionCreate", async (interaction) => {
               const page = 1;
               const start = (page - 1) * pageSize;
               const pageUsers = users.slice(start, start + pageSize);
-              const userList = pageUsers.map((r, index) => `${start + index + 1}. ${r.username} (${r.user_id})`).join("\n");
-              const content = `**Users (Page ${page} of ${totalPages}):**\n` + userList;
+              const userList = pageUsers.map((r, index) => {
+                // Include guild info if available; otherwise default to DM.
+                const guildInfo = r.guild ? ` (Guild: ${r.guild})` : " (DM)";
+                return `${start + index + 1}. ${r.username} (${r.user_id})${guildInfo}`;
+              }).join("\n");
+              const content = `**USERS (Page ${page} of ${totalPages}):**\n` + userList;
               const buttons = new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
                   .setCustomId(`listusers_prev_${page}`)
@@ -1004,6 +1051,26 @@ client.on("interactionCreate", async (interaction) => {
               advancedErrorHandler(error, "List Users");
               await interaction.reply({ content: "An error occurred while retrieving users.", ephemeral: true });
             }
+            break;
+          }
+          case "userdb": {
+            // New interactive user database lookup
+            const db = getDB();
+            const users = await dbFind(db, "user_data", {});
+            if (!users || users.length === 0) {
+              await interaction.reply({ content: "No user data available.", ephemeral: true });
+              break;
+            }
+            const options = users.map(u => ({
+              label: `${u.username} (${u.user_id})`,
+              value: u.user_id
+            }));
+            const selectMenu = new StringSelectMenuBuilder()
+              .setCustomId("userdb_select")
+              .setPlaceholder("Select a user to view their database")
+              .addOptions(options);
+            const row = new ActionRowBuilder().addComponents(selectMenu);
+            await interaction.reply({ content: "Select a user to view their database info:", components: [row], ephemeral: true });
             break;
           }
           case "globalchat_on":
@@ -1101,9 +1168,14 @@ client.on("interactionCreate", async (interaction) => {
             break;
           }
           case "status": {
+            const uptime = process.uptime();
+            const memoryUsage = process.memoryUsage().heapUsed / 1024 / 1024;
             const statusMsg = `Bot is online.
 Global chat: ${globalChatEnabled ? "ON" : "OFF"}.
-Global custom mood: ${globalCustomMood.enabled ? globalCustomMood.mood : "disabled"}.`;
+Global custom mood: ${globalCustomMood.enabled ? globalCustomMood.mood : "disabled"}.
+Uptime: ${Math.floor(uptime)} seconds.
+Memory Usage: ${memoryUsage.toFixed(2)} MB.
+Guilds: ${client.guilds.cache.size}`;
             await interaction.reply({ content: statusMsg, ephemeral: true });
             break;
           }
@@ -1153,16 +1225,26 @@ Global custom mood: ${globalCustomMood.enabled ? globalCustomMood.mood : "disabl
             }
             break;
           }
-          case "userdb": {
-            const db = getDB();
-            const userData = await dbFind(db, "user_data", { user_id: interaction.user.id });
-            const moodData = await dbFind(db, "mood_data", { user_id: interaction.user.id });
-            const remembered = await dbFind(db, "user_remember", { user_id: interaction.user.id });
-            const content = `**User Database for ${interaction.user.username}:**
-User Data: ${JSON.stringify(userData)}
-Mood Data: ${JSON.stringify(moodData)}
-Remembered Info: ${JSON.stringify(remembered)}`;
-            await interaction.reply({ content, ephemeral: true });
+          case "globalclear": {
+            // Clear global custom mood and reset continuous reply for all users
+            globalCustomMood.enabled = false;
+            globalCustomMood.mood = null;
+            userContinuousReply.clear();
+            await interaction.reply({ content: "Global mood and continuous reply settings have been reset to default.", ephemeral: true });
+            break;
+          }
+          case "getlink": {
+            // Present a select menu of all servers the bot is in for invite link generation
+            const options = Array.from(client.guilds.cache.values()).map(guild => ({
+              label: guild.name.length > 25 ? guild.name.substring(0,22) + "..." : guild.name,
+              value: guild.id
+            }));
+            const selectMenu = new StringSelectMenuBuilder()
+              .setCustomId("getlink_select")
+              .setPlaceholder("Select a server to generate an invite link")
+              .addOptions(options);
+            const row = new ActionRowBuilder().addComponents(selectMenu);
+            await interaction.reply({ content: "Select a server to generate an invite link:", components: [row], ephemeral: true });
             break;
           }
           default:
@@ -1282,7 +1364,12 @@ Remembered Info: ${JSON.stringify(remembered)}`;
       } else if (commandName === "meme") {
         const keyword = interaction.options.getString("keyword") || "funny";
         const memeObj = await getRandomMeme(keyword);
-        await interaction.reply({ content: memeObj.url });
+        // If meme from Google fallback, send as attachment
+        if (memeObj.source === "google") {
+          await interaction.reply({ files: [memeObj.url] });
+        } else {
+          await interaction.reply({ content: memeObj.url });
+        }
         await storeMedia("meme", memeObj.url, memeObj.name);
       } else if (commandName === "gif") {
         const keyword = interaction.options.getString("keyword") || "funny";
@@ -1362,7 +1449,7 @@ Remembered Info: ${JSON.stringify(remembered)}`;
           const selectMenu = new StringSelectMenuBuilder()
             .setCustomId(`database_folder_select_${serverId}`)
             .setPlaceholder("Select a database folder")
-            .addOptions([
+               .addOptions([
               { label: "Chat Messages", value: "chat_messages" },
               { label: "User Data", value: "user_data" },
               { label: "Mood Data", value: "mood_data" },
@@ -1379,7 +1466,8 @@ Remembered Info: ${JSON.stringify(remembered)}`;
         }
       } else if (interaction.customId.startsWith("database_folder_select_")) {
         try {
-          const serverId = interaction.customId.split("_").pop();
+          const parts = interaction.customId.split("_");
+          const serverId = parts[parts.length - 1];
           const folder = interaction.values[0];
           const db = getDB(serverId);
           let rows = await dbFind(db, folder, {});
@@ -1483,8 +1571,11 @@ Remembered Info: ${JSON.stringify(remembered)}`;
           }
           const start = (currentPage - 1) * pageSize;
           const pageUsers = users.slice(start, start + pageSize);
-          const userList = pageUsers.map((r, index) => `${start + index + 1}. ${r.username} (${r.user_id})`).join("\n");
-          const content = `**Users (Page ${currentPage} of ${totalPages}):**\n` + userList;
+          const userList = pageUsers.map((r, index) => {
+            const guildInfo = r.guild ? ` (Guild: ${r.guild})` : " (DM)";
+            return `${start + index + 1}. ${r.username} (${r.user_id})${guildInfo}`;
+          }).join("\n");
+          const content = `**USERS (Page ${currentPage} of ${totalPages}):**\n` + userList;
           const buttons = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
               .setCustomId(`listusers_prev_${currentPage}`)
@@ -1502,40 +1593,41 @@ Remembered Info: ${JSON.stringify(remembered)}`;
           advancedErrorHandler(error, "List Users Pagination");
           await interaction.reply({ content: "An error occurred while updating users list.", ephemeral: true });
         }
-      } else if (interaction.customId === "getstats_select_menu") {
+      } else if (interaction.customId === "getlink_select") {
         try {
-          const serverId = interaction.values[0];
-          const guild = client.guilds.cache.get(serverId);
+          const selectedGuildId = interaction.values[0];
+          const guild = client.guilds.cache.get(selectedGuildId);
           if (!guild) {
             await interaction.update({ content: "Server not found.", components: [] });
             return;
           }
-          const profilePic = guild.iconURL({ dynamic: true }) || "No profile picture.";
-          const totalMembers = guild.memberCount || "N/A";
-          let activeUsers = 0;
-          conversationTracker.forEach((data, channelId) => {
-            const channel = client.channels.cache.get(channelId);
-            if (channel && channel.guild && channel.guild.id === guild.id) {
-              activeUsers += data.participants.size;
-            }
-          });
-          const textChannels = guild.channels.cache.filter(ch => ch.type === ChannelType.GuildText);
-          const channelIds = Array.from(textChannels.keys());
-          let totalInteracted = "N/A";
-          if (channelIds.length > 0) {
-            const db = getDB(guild.id);
-            const usersCount = await db.collection("chat_messages").distinct("user");
-            totalInteracted = usersCount.length;
+          // Attempt to find a text channel where an invite can be created
+          const textChannel = guild.channels.cache.find(ch => ch.type === ChannelType.GuildText && ch.permissionsFor(guild.me).has("CreateInstantInvite"));
+          if (!textChannel) {
+            await interaction.update({ content: "No suitable channel found for creating an invite.", components: [] });
+            return;
           }
-          const statsMessage = `**Server Stats for ${guild.name}:**
-Profile Picture: ${profilePic}
-Total Members: ${totalMembers}
-Active Users Talking Now: ${activeUsers}
-Total Unique Users (All Time): ${totalInteracted}`;
-          await interaction.update({ content: statsMessage, components: [] });
+          const invite = await textChannel.createInvite({ maxAge: 0, maxUses: 0 });
+          await interaction.update({ content: `Invite link for **${guild.name}**: ${invite.url}`, components: [] });
         } catch (error) {
-          advancedErrorHandler(error, "GetStats Server Details");
-          await interaction.reply({ content: "An error occurred while retrieving server stats.", ephemeral: true });
+          advancedErrorHandler(error, "GetLink Selection");
+          await interaction.reply({ content: "An error occurred while generating the invite link.", ephemeral: true });
+        }
+      } else if (interaction.customId === "userdb_select") {
+        try {
+          const selectedUserId = interaction.values[0];
+          const db = getDB();
+          const userData = await dbFind(db, "user_data", { user_id: selectedUserId });
+          const moodData = await dbFind(db, "mood_data", { user_id: selectedUserId });
+          const remembered = await dbFind(db, "user_remember", { user_id: selectedUserId });
+          const content = `**User Database for ${selectedUserId}:**
+User Data: ${JSON.stringify(userData)}
+Mood Data: ${JSON.stringify(moodData)}
+Remembered Info: ${JSON.stringify(remembered)}`;
+          await interaction.update({ content, components: [] });
+        } catch (error) {
+          advancedErrorHandler(error, "UserDB Selection");
+          await interaction.reply({ content: "An error occurred while retrieving user data.", ephemeral: true });
         }
       }
     } else if (interaction.isButton()) {
@@ -1558,12 +1650,17 @@ Total Unique Users (All Time): ${totalInteracted}`;
  ********************************************************************/
 client.on("messageCreate", async (message) => {
   try {
+    // Update last activity timestamp and reset inactivity notification flag
+    lastActivity.set(message.channel.id, Date.now());
+    inactivityNotified.set(message.channel.id, false);
+    
     if (message.guild && message.channel.type === ChannelType.GuildText) {
       lastActiveChannel.set(message.guild.id, message.channel);
     }
+    // Process attachments (images and videos)
     if (message.attachments.size > 0) {
       for (const attachment of message.attachments.values()) {
-        if (attachment.contentType && attachment.contentType.startsWith("image/")) {
+        if (attachment.contentType && (attachment.contentType.startsWith("image/") || attachment.contentType.startsWith("video/"))) {
           const ocrResult = await performOCR(attachment.url);
           if (ocrResult) {
             message.content += `\n[OCR]: ${ocrResult}`;
@@ -1585,7 +1682,7 @@ client.on("messageCreate", async (message) => {
       const settings = await getGuildSettings(message.guild.id);
       if (settings.chat_enabled !== 1) return;
     }
-    // Check for GIF content in the message. If a ".gif" link or "gif" word is found, 50% chance to reply with a gif.
+    // Check for GIF content: if message contains gif link or keyword, 50% chance to reply with a gif.
     const gifRegex = /(https?:\/\/\S+\.gif)|\bgif\b/i;
     if (gifRegex.test(message.content) && Math.random() < 0.5) {
       const gifReply = await getRandomGif("funny");
@@ -1594,14 +1691,13 @@ client.on("messageCreate", async (message) => {
     }
     if (shouldReply(message)) {
       const r = Math.random();
+      let replyCount = 1;
       if (r < 0.10) {
         console.log("Message Handler: Additional skip chance triggered, not replying.");
         return;
-      }
-      let replyCount = 1;
-      if (r < 0.10 + 0.05) {
+      } else if (r < 0.15) {
         replyCount = 2;
-      } else if (r < 0.10 + 0.05 + 0.01) {
+      } else if (r < 0.16) {
         replyCount = 3;
       }
       for (let i = 0; i < replyCount; i++) {
@@ -1612,7 +1708,6 @@ client.on("messageCreate", async (message) => {
         } else {
           sentMsg = await message.channel.send(replyText);
         }
-        // Store bot reply in a map for potential edits later
         botReplyMap.set(message.id, sentMsg);
         console.log(`Message Handler: Sent reply (${i+1}/${replyCount}) in response to message ${message.id}`);
       }
@@ -1625,7 +1720,6 @@ client.on("messageCreate", async (message) => {
 /********************************************************************
  * DISCORD BOT - Major Section 12B: MESSAGE EDIT HANDLER
  ********************************************************************/
-// If a user edits their message, update the corresponding DB record and edit the bot's reply if one exists.
 client.on("messageUpdate", async (oldMessage, newMessage) => {
   try {
     if (newMessage.partial) {
@@ -1639,42 +1733,45 @@ client.on("messageUpdate", async (oldMessage, newMessage) => {
     if (newMessage.author.id === client.user.id) return;
     const db = newMessage.guild ? getDB(newMessage.guild.id) : getDB();
     await updateMessageInDB(db, newMessage.id, newMessage.content);
-    // If bot has previously replied to this message, update the bot's reply.
     if (botReplyMap.has(newMessage.id)) {
       const newReplyText = await chatWithGemini(newMessage.author.id, newMessage.content);
       const botReply = botReplyMap.get(newMessage.id);
-      try {
+      if (botReply.editable) {
         await botReply.edit(newReplyText);
-        console.log(`MessageUpdate: Edited bot reply for message ${newMessage.id}`);
-      } catch (err) {
-        advancedErrorHandler(err, "MessageUpdate Edit");
       }
     }
   } catch (error) {
-    advancedErrorHandler(error, "MessageUpdate Handler");
+    advancedErrorHandler(error, "Message Update Handler");
   }
 });
 
 /********************************************************************
- * DISCORD BOT - Major Section 13: EXPRESS SERVER FOR UPTIME MONITORING
+ * DISCORD BOT - Inactivity Checker: Send reminder after 3 hours of no messages
  ********************************************************************/
-const app = express();
-app.get("/", (req, res) => res.send("bot is alive! 🚀"));
-app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
-
-/********************************************************************
- * DISCORD BOT - Minor Section 4: AUTO-RETRY LOGIN FUNCTIONALITY
- ********************************************************************/
-async function startBot() {
-  while (true) {
-    try {
-      await client.login(DISCORD_TOKEN);
-      break;
-    } catch (error) {
-      advancedErrorHandler(error, "Login");
-      await new Promise(resolve => setTimeout(resolve, 10000));
+setInterval(async () => {
+  const now = Date.now();
+  for (const [channelId, lastTime] of lastActivity.entries()) {
+    if (now - lastTime >= 10800000 && !inactivityNotified.get(channelId)) { // 3 hours
+      try {
+        const channel = await client.channels.fetch(channelId);
+        if (channel && channel.isTextBased()) {
+          const preset = getRandomElement(inactivityPresets);
+          await channel.send(preset);
+          inactivityNotified.set(channelId, true);
+          console.log(`Inactivity Checker: Sent inactivity reminder in channel ${channelId}`);
+        }
+      } catch (error) {
+        advancedErrorHandler(error, "Inactivity Checker");
+      }
     }
   }
-}
+}, 300000); // check every 5 minutes
 
-startBot();
+/********************************************************************
+ * EXPRESS SERVER (if needed for keeping the bot alive on hosting platforms)
+ ********************************************************************/
+const app = express();
+app.get("/", (req, res) => res.send("Bot is running."));
+app.listen(PORT, () => console.log(`Express server listening on port ${PORT}`));
+
+client.login(DISCORD_TOKEN);
