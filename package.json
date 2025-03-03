@@ -1,5 +1,6 @@
 {
   "name": "buttercup",
+  "version": "1.0.0",
   "description": "buttercup is my good friend",
   "main": "buttercup.js",
   "type": "module",
@@ -13,7 +14,8 @@
     "express": "*",
     "mongodb": "*",
     "node-fetch": "*",
-    "@google/generative-ai": "*"
+    "@google/generative-ai": "*",
+    "fs": "*"
   },
   "engines": {
     "node": ">=18.0.0"
